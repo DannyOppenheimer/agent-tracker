@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import terminal_focus
 import tracker
@@ -11,6 +11,35 @@ import usage
 
 
 class NavigationTests(unittest.TestCase):
+    def test_visible_pseudoconsole_selects_tab_instead_of_only_raising_window(self):
+        kernel, user = MagicMock(), MagicMock()
+        kernel.AttachConsole.return_value = True
+        kernel.GetConsoleWindow.return_value = 123
+        user.IsWindowVisible.return_value = True
+        title = ['original agent title']
+        def get_title(buffer, size):
+            buffer.value = title[0]
+            return len(title[0])
+        def set_title(value):
+            title[0] = value
+            return True
+        def get_class(handle, buffer, size):
+            buffer.value = 'PseudoConsoleWindow'
+            return len(buffer.value)
+        kernel.GetConsoleTitleW.side_effect = get_title
+        kernel.SetConsoleTitleW.side_effect = set_title
+        user.GetClassNameW.side_effect = get_class
+        with patch.object(terminal_focus.ctypes, 'WinDLL', side_effect=[kernel, user]), \
+             patch.object(terminal_focus, 'console_processes', return_value=[42]), \
+             patch.object(terminal_focus.time, 'sleep'), \
+             patch.object(terminal_focus, 'select_host', return_value=True) as select:
+            terminal_focus.focus_console(42)
+        select.assert_called_once()
+        self.assertIn('AGENT_TRACKER_FOCUS_TITLE', select.call_args.args[0])
+        user.SetForegroundWindow.assert_not_called()
+        self.assertEqual(title[0], 'original agent title')
+        kernel.FreeConsole.assert_called()
+
     def test_all_five_providers_resolve_to_their_live_process(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

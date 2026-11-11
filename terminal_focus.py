@@ -190,6 +190,7 @@ def focus_console(pid):
     kernel.SetConsoleTitleW.argtypes = [W.LPCWSTR]
     kernel.GetConsoleWindow.restype = W.HWND
     user.IsWindowVisible.argtypes = [W.HWND]
+    user.GetClassNameW.argtypes = [W.HWND, W.LPWSTR, ctypes.c_int]
     user.ShowWindowAsync.argtypes = [W.HWND, ctypes.c_int]
     user.SetForegroundWindow.argtypes = [W.HWND]
     kernel.FreeConsole()
@@ -201,7 +202,10 @@ def focus_console(pid):
     changed = False
     try:
         window = kernel.GetConsoleWindow()
-        if window and user.IsWindowVisible(window):
+        window_class = ctypes.create_unicode_buffer(256)
+        if window:
+            user.GetClassNameW(window, window_class, len(window_class))
+        if window_class.value == 'ConsoleWindowClass' and user.IsWindowVisible(window):
             user.ShowWindowAsync(window, 9)
             if user.SetForegroundWindow(window):
                 return
