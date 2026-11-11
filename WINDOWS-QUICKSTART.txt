@@ -1,22 +1,34 @@
-AI Agent Tracker for Windows
+AI Agent Tracker v0.2.0 for Windows
 
 Extract the entire ZIP to a folder you can keep. Double-click agent-tracker.exe
 to open the dashboard. You can also run .\agent-tracker.exe from PowerShell.
 Add the extracted agent-tracker folder to your user PATH to use the
 agent-tracker command from any directory in new terminals.
 
-The dashboard shows local Claude Code, Codex, and Antigravity chats when
-available. Usage tiles appear as the agents report data. If Gemini has a
-separate usage page, Right Arrow opens it and Left Arrow returns. Use Up/Down
-or the mouse wheel to scroll and Ctrl+C to exit.
+The dashboard shows local Claude Code, Codex, Antigravity, Muse Code, and Grok
+Build chats. Chats are ordered by the latest user prompt. Detected message
+exchanges appear together in a colored box with inset gray dividers.
+Account usage cards appear two per page; Left/Right Arrow switches pages.
+Context, tokens, and directly reported costs appear beside individual sessions
+when available. Click [Go to terminal] to activate an agent's terminal tab.
+Use Up/Down or the mouse wheel to scroll and Q or Ctrl+C to exit.
 
 Use your existing agent installations and sign in normally. On launch, the
-tracker configures usage collection for detected Claude and Antigravity
+tracker configures usage collection for detected Claude, Antigravity, and Grok
 installations with no status line configured. Reopen the affected agent to
 start collecting. If you already have a custom status line, it is preserved.
-For custom setups, append --capture-claude-usage or --capture-antigravity-usage
+For custom setups, append --capture-claude-usage, --capture-antigravity-usage,
+or --capture-grok-usage
 to the full path to agent-tracker.exe and pass the status-line JSON on stdin.
 Codex account usage requires the Codex CLI and an authenticated account.
+Muse account usage requires Muse Code 1.4.13 or newer; Grok account usage uses
+the official Grok CLI. Both use the CLI's existing login. Keep the tracker in
+this folder after configuring collectors, since their commands use its path.
+
+When upgrading, close the tracker and replace the entire extracted folder,
+including _internal. Extract to the same location to retain collector paths.
+Full setup, limitations, and release notes:
+https://github.com/DannyOppenheimer/agent-tracker
 
 Windows 10/11 with the architecture named on the ZIP is the target.
 Keep the bundled _internal folder beside the executable. Python is bundled.

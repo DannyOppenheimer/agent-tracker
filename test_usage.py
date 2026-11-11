@@ -62,7 +62,7 @@ class UsageTests(unittest.TestCase):
             snapshot['Claude'] = dict(model=dict(display_name='Sonnet'))
             main = '\n'.join(usage_panels(snapshot, 120, now=1000))
             self.assertIn('CLAUDE / USAGE', main)
-            self.assertNotIn('GEMINI / USAGE', main)
+            self.assertIn('GEMINI / USAGE', main)
             self.assertEqual(usage_panels(dict(Codex=dict(error='CLI unavailable')), 120), [])
 
     def test_panels_fit_terminal_and_highlight_full_quota(self):
@@ -115,7 +115,7 @@ class UsageTests(unittest.TestCase):
         self.assertIn('awaiting refresh', text)
         self.assertIn('resets left: 2', text)
         self.assertIn('Full reset | expires', text)
-        self.assertIn('reset credits: not exposed', text)
+        self.assertNotIn('reset credits: not exposed', text)
 
     def test_nonstandard_window_is_not_falsely_labelled_five_hour(self):
         text = '\n'.join(usage_lines(dict(Codex=dict(data=dict(rateLimits=dict(

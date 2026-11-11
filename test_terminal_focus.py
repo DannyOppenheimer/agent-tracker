@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +12,48 @@ import usage
 
 
 class NavigationTests(unittest.TestCase):
+    def test_codex_tab_label_matches_session_folder_and_optional_spinner(self):
+        pattern = terminal_focus.codex_tab_pattern('Fix agent (v2).', r'C:\Users\oppen\claude-tracker')
+        for label in ['Fix agent (v2). | claude-tracker', '\u283c Fix agent (v2). | claude-tracker']:
+            self.assertRegex(label, pattern)
+        for label in ['Fix agent (v2). | other-folder', 'Other Fix agent (v2). | claude-tracker',
+                      'Fix agent v2x | claude-tracker', 'Fix agent (v2). | claude-tracker extra']:
+            self.assertIsNone(re.search(pattern, label))
+
+    def test_shared_codex_server_selects_terminal_by_session_label(self):
+        with patch.object(tracker, 'thread_locked', return_value=True), \
+             patch.object(terminal_focus, 'file_owners', return_value=[123]), \
+             patch.object(terminal_focus, 'focus_console', side_effect=terminal_focus.NoConsole('daemon')), \
+             patch.object(tracker.CodexTracker, 'scan', return_value=[
+                 dict(session='live', task='Fix camera', directory=r'C:\work\game')]), \
+             patch.object(terminal_focus, 'select_host', return_value=True) as select, \
+             patch.object(terminal_focus, 'focus_app_chat') as app:
+            terminal_focus.focus_agent('Codex', 'live')
+        select.assert_called_once_with(dict(
+            AGENT_TRACKER_CODEX_TAB_PATTERN=terminal_focus.codex_tab_pattern('Fix camera', r'C:\work\game')))
+        app.assert_not_called()
+
+    def test_classic_console_restores_only_when_minimized(self):
+        for minimized in [False, True]:
+            with self.subTest(minimized=minimized):
+                kernel, user = MagicMock(), MagicMock()
+                kernel.AttachConsole.return_value = True
+                kernel.GetConsoleWindow.return_value = 123
+                user.IsWindowVisible.return_value = True
+                user.IsIconic.return_value = minimized
+                def get_class(handle, buffer, size):
+                    buffer.value = 'ConsoleWindowClass'
+                    return len(buffer.value)
+                user.GetClassNameW.side_effect = get_class
+                with patch.object(terminal_focus.ctypes, 'WinDLL', side_effect=[kernel, user]), \
+                     patch.object(terminal_focus, 'console_processes', return_value=[42]):
+                    terminal_focus.focus_console(42)
+                if minimized:
+                    user.ShowWindowAsync.assert_called_once_with(123, 9)
+                else:
+                    user.ShowWindowAsync.assert_not_called()
+                user.SetForegroundWindow.assert_called_once_with(123)
+
     def test_visible_pseudoconsole_selects_tab_instead_of_only_raising_window(self):
         kernel, user = MagicMock(), MagicMock()
         kernel.AttachConsole.return_value = True

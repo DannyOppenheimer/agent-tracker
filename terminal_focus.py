@@ -4,6 +4,7 @@ import ctypes
 from ctypes import wintypes as W
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 import uuid
@@ -100,12 +101,17 @@ Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices;
 public static class AgentTrackerWindow {
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr window, int command);
+ [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr window);
+ public static void RestoreIfMinimized(IntPtr window) {
+   if (IsIconic(window)) ShowWindowAsync(window, 9);
+ }
 }'
 $root = [System.Windows.Automation.AutomationElement]::RootElement
 $tabCondition = New-Object System.Windows.Automation.PropertyCondition(
     [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
     [System.Windows.Automation.ControlType]::TabItem)
 for ($attempt = 0; $attempt -lt 8; $attempt++) {
+    $terminalMatches = @()
     $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children,
         [System.Windows.Automation.Condition]::TrueCondition)
     foreach ($window in $windows) {
@@ -127,7 +133,7 @@ for ($attempt = 0; $attempt -lt 8; $attempt++) {
             }
             if ($targets.Count -ne 1) { continue }
             $handle = [IntPtr]$window.Current.NativeWindowHandle
-            [void][AgentTrackerWindow]::ShowWindowAsync($handle, 9)
+            [AgentTrackerWindow]::RestoreIfMinimized($handle)
             $patterns = $targets[0].GetSupportedPatterns()
             if ($patterns -contains [System.Windows.Automation.SelectionItemPattern]::Pattern) {
                 $targets[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
@@ -140,16 +146,24 @@ for ($attempt = 0; $attempt -lt 8; $attempt++) {
         if ($window.Current.ClassName -ne 'CASCADIA_HOSTING_WINDOW_CLASS') { continue }
         $tabs = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabCondition)
         foreach ($tab in $tabs) {
-            if (-not $tab.Current.Name.Contains($env:AGENT_TRACKER_FOCUS_TITLE)) { continue }
-            $handle = [IntPtr]$window.Current.NativeWindowHandle
-            [void][AgentTrackerWindow]::ShowWindowAsync($handle, 9)
-            $selection = $tab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-            $selection.Select()
-            if (-not [AgentTrackerWindow]::SetForegroundWindow($handle)) {
-                throw 'Windows prevented foreground activation. Check agent and tracker elevation levels.'
+            if ($env:AGENT_TRACKER_CODEX_TAB_PATTERN) {
+                if ($tab.Current.Name -cnotmatch $env:AGENT_TRACKER_CODEX_TAB_PATTERN) { continue }
+            } else {
+                if (-not $env:AGENT_TRACKER_FOCUS_TITLE -or
+                    -not $tab.Current.Name.Contains($env:AGENT_TRACKER_FOCUS_TITLE)) { continue }
             }
-            exit 0
+            $terminalMatches += @{ Tab = $tab; Handle = [IntPtr]$window.Current.NativeWindowHandle }
         }
+    }
+    if ($terminalMatches.Count -gt 1) { exit 4 }
+    if ($terminalMatches.Count -eq 1) {
+        $target = $terminalMatches[0]
+        [AgentTrackerWindow]::RestoreIfMinimized($target.Handle)
+        $target.Tab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+        if (-not [AgentTrackerWindow]::SetForegroundWindow($target.Handle)) {
+            throw 'Windows prevented foreground activation. Check agent and tracker elevation levels.'
+        }
+        exit 0
     }
     Start-Sleep -Milliseconds 150
 }
@@ -181,6 +195,13 @@ def focus_app_chat(pid, title):
     raise RuntimeError('Could not uniquely select this chat in the app. Keep its sidebar visible and check elevation levels')
 
 
+def codex_tab_pattern(title, directory):
+    """Match the TUI's session title and folder, including its working spinner."""
+    folder = directory.rstrip('/\\').replace('\\', '/').rsplit('/', 1)[-1]
+    # Escape for .NET regex as well as Python; Python's escaped spaces are valid in both.
+    return r'\A(?:[\u2800-\u28ff]\s+)?' + re.escape(f'{title} | {folder}') + r'\Z'
+
+
 def focus_console(pid):
     """Run only in a helper process so attaching cannot detach the dashboard."""
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -190,6 +211,7 @@ def focus_console(pid):
     kernel.SetConsoleTitleW.argtypes = [W.LPCWSTR]
     kernel.GetConsoleWindow.restype = W.HWND
     user.IsWindowVisible.argtypes = [W.HWND]
+    user.IsIconic.argtypes = [W.HWND]
     user.GetClassNameW.argtypes = [W.HWND, W.LPWSTR, ctypes.c_int]
     user.ShowWindowAsync.argtypes = [W.HWND, ctypes.c_int]
     user.SetForegroundWindow.argtypes = [W.HWND]
@@ -206,7 +228,8 @@ def focus_console(pid):
         if window:
             user.GetClassNameW(window, window_class, len(window_class))
         if window_class.value == 'ConsoleWindowClass' and user.IsWindowVisible(window):
-            user.ShowWindowAsync(window, 9)
+            if user.IsIconic(window):
+                user.ShowWindowAsync(window, 9)
             if user.SetForegroundWindow(window):
                 return
             raise RuntimeError('Windows prevented terminal activation; check elevation levels')
@@ -282,4 +305,10 @@ def focus_agent(provider, sid):
         if provider != 'Codex':
             raise
         session = next((item for item in CodexTracker().scan() if item['session'] == sid), {})
+        # Recent Codex TUIs share an app server, which owns every thread lock.
+        # Its PID cannot identify the frontend console. Match the TUI's exact
+        # session/folder label across all windows, refusing duplicate labels.
+        if session.get('task') and session.get('directory') and select_host(dict(
+                AGENT_TRACKER_CODEX_TAB_PATTERN=codex_tab_pattern(session['task'], session['directory']))):
+            return
         focus_app_chat(owners[0], session.get('task'))

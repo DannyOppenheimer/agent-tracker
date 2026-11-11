@@ -1,14 +1,15 @@
 """Quota collection without model calls or stored credentials."""
 import json
-import math
 import os
 from pathlib import Path
 import queue
-import re
 import subprocess
-import textwrap
 import threading
 import time
+from quota import cli_command, muse_usage, grok_usage
+from session_usage import collected_sessions, session_key
+from usage_adapters import PROVIDERS, tile_pages
+from usage_tiles import ANSI, RED, tile_lines, render_tiles
 
 
 def codex_usage(command):
@@ -57,7 +58,7 @@ def codex_usage(command):
 
 def capture_claude(payload, home):
     """Called by Claude's status line. Store only display data, never chat text."""
-    saved = {key: payload[key] for key in ('rate_limits', 'model', 'cost', 'context_window') if key in payload}
+    saved = {key: payload[key] for key in ('rate_limits', 'model', 'cost', 'context_window', 'billing_mode', 'token_spend') if key in payload}
     saved['updated_at'] = time.time()
     folder = Path(home) / 'tracker-usage'
     folder.mkdir(parents=True, exist_ok=True)
@@ -79,7 +80,7 @@ def antigravity_home():
 
 def capture_antigravity(payload, home=None):
     """Persist only documented display fields; no credentials or chat content."""
-    saved = {key: payload[key] for key in ('quota', 'model', 'context_window', 'plan_tier', 'cost') if key in payload}
+    saved = {key: payload[key] for key in ('quota', 'model', 'context_window', 'plan_tier', 'cost', 'billing_mode', 'token_spend') if key in payload}
     saved['updated_at'] = time.time()
     import hashlib
     name = hashlib.sha256(str(payload.get('session_id') or payload.get('conversation_id') or 'default').encode()).hexdigest()[:24]
@@ -110,85 +111,59 @@ def antigravity_snapshot(home=None):
     return latest
 
 
-def gemini_lines(snapshot, now=None):
-    from datetime import datetime
-    now = time.time() if now is None else now
-    data = snapshot.get('Gemini') or {}
-    stamp = data.get('quota_updated_at', data.get('updated_at', 0))
-    lines = ['Gemini usage | updated ' + (duration(now-stamp) + ' ago' if stamp else 'never')]
-    if data.get('plan_tier'):
-        lines.append('  plan: ' + str(data['plan_tier']))
-    quota = data.get('quota') or {}
-    if not quota:
-        lines.append('  Waiting for Antigravity status-line data; restart agy and send a prompt.')
-    for label, bucket in quota.items():
-        if not isinstance(bucket, dict):
-            continue
-        if bucket.get('disabled'):
-            lines.append('  ' + label + ': disabled')
-            continue
-        reset = bucket.get('reset_time')
-        if isinstance(reset, str):
-            try:
-                reset = datetime.fromisoformat(reset.replace('Z', '+00:00')).timestamp()
-            except ValueError:
-                reset = None
-        if reset is None and isinstance(bucket.get('reset_in_seconds'), (int, float)):
-            reset = stamp + bucket['reset_in_seconds']
-        fraction = bucket.get('remaining_fraction')
-        if isinstance(fraction, (int, float)) and math.isfinite(fraction) and 0 <= fraction <= 1:
-            lines.append('  ' + window_text(label, dict(usedPercent=round((1-fraction)*100, 2), resetsAt=reset), now))
-        elif isinstance(bucket.get('remaining_amount'), (int, float)):
-            lines.append(f"  {label}: {bucket['remaining_amount']:g} remaining | resets {reset_text(reset, now)}")
-        else:
-            lines.append('  ' + label + ': unavailable')
-    return lines
-
-
-def duration(seconds):
-    minutes = max(0, math.ceil(seconds / 60))
-    days, minutes = divmod(minutes, 1440)
-    hours, minutes = divmod(minutes, 60)
-    return (f'{days}d ' if days else '') + (f'{hours}h ' if hours or days else '') + f'{minutes}m'
-
-
-def reset_text(timestamp, now):
-    if not isinstance(timestamp, (int, float)):
-        return 'reset unknown'
-    local = time.strftime('%a %H:%M', time.localtime(timestamp))
-    return ('awaiting refresh' if timestamp <= now else 'in ' + duration(timestamp - now)) + f' ({local})'
-
-
-def window_text(label, window, now, claude=False):
-    percent = window.get('used_percentage' if claude else 'usedPercent')
-    if not isinstance(percent, (int, float)) or not math.isfinite(percent):
-        return label + ': unavailable'
-    filled = round(max(0, min(100, percent)) / 10)
-    reset = window.get('resets_at' if claude else 'resetsAt')
-    text = f'{label} [{"#" * filled}{"-" * (10-filled)}] {percent:g}% used ({max(0, 100-percent):g}% left) | resets {reset_text(reset, now)}'
-    if window.get('used_usd') is not None:
-        text += f' | ${window["used_usd"]:g}/${window.get("limit_usd", 0):g}'
-    return text
-
-
 class Usage:
     def __init__(self, home, command, start=True):
         self.home, self.command = Path(home), command
         self.lock = threading.Lock()
         self.data, self.updated, self.error = {}, 0, ''
         self.stop = threading.Event()
+        muse_home = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local' / 'share') / 'muse'
+        grok_home = Path(os.environ.get('GROK_HOME') or Path.home() / '.grok')
+        self.extra = {name: dict(data={}, updated_at=0, error='',
+                                detected=bool(cli_command(name.lower()) or folder.is_dir()))
+                      for name, folder in [('Muse', muse_home), ('Grok', grok_home)]}
         if start:
-            threading.Thread(target=self._worker, daemon=True).start()
+            for provider in ('Codex', 'Muse', 'Grok'):
+                if provider == 'Codex' or self.extra[provider]['detected']:
+                    threading.Thread(target=self._worker, args=(provider,), daemon=True).start()
 
-    def _worker(self):
-        while not self.stop.is_set():
-            try:
+    def refresh(self, provider):
+        try:
+            if provider == 'Codex':
                 result = codex_usage(self.command())
-                with self.lock:
+            else:
+                command = cli_command(provider.lower())
+                if not command:
+                    if not self.extra[provider]['detected']:
+                        return
+                    raise FileNotFoundError(provider + ' CLI unavailable')
+                result = {'Muse': muse_usage, 'Grok': grok_usage}[provider](command)
+            if not isinstance(result, dict):
+                raise ValueError('Invalid usage response')
+            with self.lock:
+                if provider == 'Codex':
                     self.data, self.updated, self.error = result, time.time(), ''
-            except Exception:
-                with self.lock:
-                    self.error = 'refresh failed; check Codex login/network'
+                else:
+                    self.extra[provider].update(data=result, updated_at=time.time(), error='', detected=True)
+        except Exception:
+            with self.lock:
+                error = ('refresh failed; check ' + provider + ' CLI, login, version, and network')
+                if provider == 'Codex':
+                    self.error = error
+                else:
+                    self.extra[provider]['error'] = error
+
+    def refresh_all(self):
+        workers = [threading.Thread(target=self.refresh, args=(provider,))
+                   for provider in ('Codex', 'Muse', 'Grok')]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+    def _worker(self, provider='Codex'):
+        while not self.stop.is_set():
+            self.refresh(provider)
             self.stop.wait(60)
 
     def snapshot(self):
@@ -208,178 +183,71 @@ class Usage:
             latest['rate_limits'] = latest_quota['rate_limits']
             latest['quota_updated_at'] = latest_quota['updated_at']
         with self.lock:
-            return dict(Claude=latest, Codex=dict(data=self.data, updated_at=self.updated, error=self.error), Gemini=antigravity_snapshot())
+            return dict(Claude=latest, Codex=dict(data=self.data, updated_at=self.updated, error=self.error),
+                        Gemini=antigravity_snapshot(),
+                        **{name: dict(value) for name, value in self.extra.items()})
+
+    def observe_sessions(self, sessions, collector_homes=None):
+        homes = collector_homes if collector_homes is not None else {
+            'Claude': self.home, 'Antigravity': antigravity_home(),
+            'Grok': Path(os.environ.get('GROK_HOME') or Path.home() / '.grok')}
+        collectors = {provider: collected_sessions(home) for provider, home in homes.items()}
+        for session in sessions:
+            sid = session.get('session')
+            if not sid:
+                continue
+            provider = session.get('provider', 'Claude')
+            key = session_key(sid)
+            metrics = collectors.get(provider, {}).get(key, session.get('usage') or {})
+            session['usage'] = metrics
 
     def lines(self, now=None, width=120, page=0):
         return usage_panels(self.snapshot(), width, now, page)
 
 
+def provider_lines(name, state, now=None):
+    spec = next(spec for spec in PROVIDERS if spec.name == name)
+    return tile_lines(spec.adapter(spec, state), now)
+
+
 def usage_lines(snapshot, now=None):
+    # Legacy plain-text entry point uses the same model as graphical tiles.
+    return [line for name in ('Claude', 'Codex')
+            for line in provider_lines(name, snapshot.get(name) or {}, now)]
+
+
+def gemini_lines(snapshot, now=None):
+    return provider_lines('Gemini', snapshot.get('Gemini') or {}, now)
+
+
+def allowance_lines(name, state, now=None):
+    return provider_lines(name, state, now)
+
+
+def demo_usage(now=None):
     now = time.time() if now is None else now
-    lines = []
-    claude = snapshot.get('Claude') or {}
-    limits = claude.get('rate_limits') or {}
-    stamp = claude.get('quota_updated_at', claude.get('updated_at', 0))
-    age = duration(now-stamp) if stamp else 'never'
-    lines.append('Claude usage | updated ' + age + (' ago' if stamp else '') + ' | reset credits: not exposed')
-    if not limits:
-        lines.append('  Waiting for Claude status-line data; send a prompt in Claude (restart session if needed).')
-    for key, window in limits.items():
-        if isinstance(window, dict):
-            label = {'five_hour': '5h', 'seven_day': 'week'}.get(key, key.replace('_', ' '))
-            lines.append('  ' + window_text(label, window, now, True))
-    context = (claude.get('context_window') or {}).get('used_percentage')
-    cost = (claude.get('cost') or {}).get('total_cost_usd')
-    extras = []
-    if context is not None:
-        extras.append(f'latest session context: {context:g}%')
-    if cost is not None:
-        extras.append(f'session API-equivalent cost: ${cost:.4f}')
-    if extras:
-        lines.append('  ' + ' | '.join(extras))
-    codex = snapshot.get('Codex') or {}
-    data = codex.get('data') or {}
-    stamp = codex.get('updated_at', 0)
-    credits = data.get('rateLimitResetCredits') or {}
-    count = credits.get('availableCount')
-    lines.append('Codex usage | updated ' + (duration(now-stamp) + ' ago' if stamp else 'never') +
-        ' | resets left: ' + (str(count) if count is not None else 'not reported') +
-        (' | ' + codex['error'] if codex.get('error') else ''))
-    buckets = data.get('rateLimitsByLimitId') or {}
-    if not buckets and data.get('rateLimits'):
-        buckets = {'codex': data['rateLimits']}
-    if not buckets:
-        lines.append('  ' + ('Usage unavailable' if codex.get('error') else 'Fetching account limits...'))
-    for identity, bucket in buckets.items():
-        metadata = []
-        if bucket.get('planType'):
-            metadata.append('plan: ' + str(bucket['planType']))
-        if bucket.get('spendControlReached'):
-            metadata.append('spend control reached')
-        if data.get('ordinaryUsageAllowed') is False:
-            metadata.append('ordinary usage blocked')
-        if metadata:
-            lines.append('  ' + ' | '.join(metadata))
-        for key in ('primary', 'secondary'):
-            window = bucket.get(key)
-            if not isinstance(window, dict):
-                continue
-            mins = window.get('windowDurationMins')
-            label = {300: '5h', 10080: 'week'}.get(mins, duration(mins*60) if isinstance(mins, (int, float)) else key)
-            prefix = (bucket.get('limitName') or identity) + ' ' if len(buckets) > 1 else ''
-            lines.append('  ' + window_text(prefix + label, window, now))
-        balance = bucket.get('credits') or {}
-        if balance:
-            lines.append('  Credits: ' + ('unlimited' if balance.get('unlimited') else str(balance.get('balance', 'not reported'))) +
-                         ' | credits enabled: ' + str(balance.get('hasCredits', False)))
-        if bucket.get('rateLimitReachedType'):
-            lines.append('  Limit reached: ' + str(bucket['rateLimitReachedType']))
-    for credit in credits.get('credits') or []:
-        if credit.get('status') == 'available':
-            lines.append('  ' + str(credit.get('title') or 'Reset credit') + ' | expires ' + reset_text(credit.get('expiresAt'), now))
-    return lines
+    snapshot = dict(
+        Claude=dict(updated_at=now, rate_limits=dict(five_hour=dict(used_percentage=35, resets_at=now+7200))),
+        Codex=dict(updated_at=now, data=dict(rateLimits=dict(primary=dict(
+            usedPercent=20, windowDurationMins=300, resetsAt=now+10800)))),
+        Gemini=dict(updated_at=now, quota=dict(weekly=dict(remaining_fraction=.6, reset_in_seconds=86400))))
+    # Illustrate all three display modes; these are sample billing states.
+    snapshot['Muse'] = dict(detected=True, updated_at=now, data=dict(
+        plan='Demo', subscription_status='inactive', windows=[]))
+    snapshot['Grok'] = dict(detected=True, updated_at=now, data=dict(
+        plan='Demo token billing', billing_mode='token', token_spend=dict(
+            tokens=12500, cost_usd=.034, estimated=True, scope='Demo session'),
+        details=[dict(label='Prepaid credits', value='$12.50')]))
+    return snapshot
 
 
-# True-color terminal palette: warm Claude, cool Codex, bright primary text.
-ESC = '\x1b['
-RESET = ESC + '0m'
-WHITE = ESC + '38;2;235;241;250m'
-MUTED = ESC + '38;2;158;176;198m'
-TRACK = ESC + '38;2;56;72;94m'
-GOLD = ESC + '38;2;255;202;104m'
-RED = ESC + '38;2;255;112;125m'
-MINT = ESC + '38;2;112;224;185m'
-ANSI = re.compile(r'\x1b\[[0-9;]*m')
+def usage_pages(snapshot):
+    return [[tile.provider for tile in page] for page in tile_pages(snapshot)]
 
 
 def usage_panels(snapshot, width, now=None, page=0):
-    """Compose bounded provider cards; wrap plain text before adding ANSI color."""
-    raw = usage_lines(snapshot, now)
-    split = next(i for i, line in enumerate(raw) if line.startswith('Codex usage'))
-    providers = []
-    if snapshot.get('Claude'):
-        providers.append(('Claude', raw[:split], ESC+'38;2;245;164;110m'))
-    if (snapshot.get('Codex') or {}).get('data'):
-        providers.append(('Codex', raw[split:], ESC+'38;2;116;190;255m'))
-    if (page or not providers) and snapshot.get('Gemini'):
-        providers = [('Gemini', gemini_lines(snapshot, now), MINT)]
-    if not providers:
+    pages = tile_pages(snapshot)
+    if not pages:
         return []
-    side_by_side = len(providers) == 2 and width >= 110
-    card_width = max(12, (width - 5) // 2 if side_by_side else width - 2)
-
-    def safe(text):
-        return re.sub(r'[\x00-\x1f\x7f-\x9f]', '', str(text))
-
-    def card(name, source, accent):
-        inside = card_width - 4
-        rows = []
-        def row(text='', style=WHITE):
-            # Padding counts visible characters only, never escape sequences.
-            visible = len(ANSI.sub('', text))
-            rows.append(accent + '│ ' + style + text + ' ' * max(0, inside-visible) + RESET + accent + ' │' + RESET)
-        def wrapped(text, style=MUTED):
-            for part in textwrap.wrap(safe(text), width=inside) or ['']:
-                row(part, style)
-        title = (' ' + name.upper() + ' / USAGE ')[:card_width-3]
-        rows.append(accent + '╭─' + ESC + '1m' + title + RESET + accent + '─' * max(0, card_width-len(title)-3) + '╮' + RESET)
-        header = safe(source[0]).split(' | ')
-        # Keep freshness secondary; resets are a distinct, bright badge.
-        freshness = next((x for x in header if x.startswith('updated ')), '')
-        resets = next((x for x in header if x.startswith(('resets left:', 'reset credits:'))), '')
-        if name == 'Codex':
-            wrapped(resets.upper(), MINT + ESC + '1m')
-        for item in source[1:]:
-            text = safe(item).strip()
-            match = re.match(r'(.+?) \[[#-]+\] ([\d.]+)% used \(([\d.]+)% left\) \| resets (.*)', text)
-            if match:
-                label, percent, remaining, reset = match.groups()
-                value = float(percent)
-                ink = RED if value >= 90 else GOLD if value >= 70 else accent
-                # Solid fill with a fractional end-cap; the percentage remains exact.
-                cells = max(4, min(18, inside - len(label) - len(percent) - 12))
-                units = round(max(0, min(100, value)) / 100 * cells * 8)
-                full, fraction = divmod(units, 8)
-                bar = '█' * full + ('▏▎▍▌▋▊▉'[fraction-1] if fraction else '')
-                empty = cells - full - bool(fraction)
-                meter = ink + bar + TRACK + '░' * empty + RESET
-                summary = f'{label.upper():<5} ' + meter + ink + ESC + '1m' + f' {percent}% used' + RESET
-                if len(ANSI.sub('', summary)) <= inside:
-                    row(summary)
-                else:
-                    wrapped(f'{label.upper()} {percent}% used', ink)
-                wrapped(f'↳ {remaining}% left · reset {reset}', WHITE)
-            elif text.startswith('Full reset') or ' | expires ' in text:
-                wrapped('↻ ' + text.replace(' | expires ', ' · expires '), MINT)
-            elif text.startswith('Limit reached:') or 'blocked' in text or 'reached' in text:
-                wrapped('! ' + text, RED)
-            elif text.startswith('plan:'):
-                wrapped(text.replace('plan:', 'PLAN').replace(' | ', ' · '), accent)
-            else:
-                text = text.replace('latest session context:', 'Context').replace(
-                    'session API-equivalent cost:', 'Session ≈').replace('credits enabled: False', 'no paid credits')
-                wrapped(text.replace(' | ', ' · '), MUTED)
-        row('─' * inside, TRACK)
-        wrapped('◷ ' + freshness, MUTED)
-        if name == 'Claude':
-            wrapped('Reset credits unavailable', MUTED)
-        error = (snapshot.get(name) or {}).get('error')
-        if error:
-            wrapped('! ' + error, GOLD)
-        rows.append(accent + '╰' + '─' * (card_width-2) + '╯' + RESET)
-        return rows
-
-    cards = [card(*provider) for provider in providers]
-    if not side_by_side:
-        return [' ' + line for rows in cards for line in rows]
-    height = max(map(len, cards))
-    for index, (_, _, accent) in enumerate(providers):
-        # Equal-height silhouettes make the two panels read as one dashboard.
-        while len(cards[index]) < height:
-            cards[index].insert(-1, accent + '│' + ' ' * (card_width-2) + '│' + RESET)
-    result = []
-    for i in range(height):
-        left = cards[0][i] if i < len(cards[0]) else ' ' * card_width
-        right = cards[1][i] if i < len(cards[1]) else ' ' * card_width
-        result.append(' ' + left + '   ' + right)
-    return result
+    return render_tiles(pages[min(max(0, page), len(pages)-1)], width, now,
+                        sizing_tiles=[tile for group in pages for tile in group])

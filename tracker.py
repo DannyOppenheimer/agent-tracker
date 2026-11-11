@@ -1,7 +1,9 @@
 """Full-screen, local Claude Code session dashboard. No dependencies."""
 import argparse
 import hashlib
+from itertools import zip_longest
 import ctypes
+from datetime import datetime, timezone
 from contextlib import closing
 from ctypes import wintypes as W
 import json
@@ -17,15 +19,22 @@ import threading
 import textwrap
 import tempfile
 import time
-from urllib.parse import urlsplit
+import tomllib
+from urllib.parse import quote, urlsplit
 from urllib.request import url2pathname
-from usage import Usage, antigravity_home, capture_claude, capture_antigravity, usage_panels
+from usage import Usage, antigravity_home, capture_claude, capture_antigravity, usage_panels, usage_pages, demo_usage
+from session_usage import CodexSessionUsage, MuseSessionUsage, session_metric_lines
+from message_groups import MessageGroups, session_blocks, fit_terminal
 
 HOME = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude')))
 E = '\x1b['
 ORANGE = E + '38;2;238;145;87m'
 BLUE = E + '38;2;112;181;255m'
 PURPLE = E + '38;2;196;143;255m'
+PINK = E + '38;2;255;153;204m'
+LIGHT_GRAY = E + '38;2;170;170;170m'
+PROVIDER_COLORS = {'Claude': ORANGE, 'Codex': BLUE, 'Antigravity': PURPLE,
+                   'Muse': PINK, 'Grok': LIGHT_GRAY}
 RESET = E + '0m'
 DIM = E + '2m'
 
@@ -66,6 +75,28 @@ def configure_usage_collectors():
                 temporary.unlink(missing_ok=True)
         except (OSError, ValueError):
             messages.append(f'Could not connect {name} usage')
+    grok_home = Path(os.environ.get('GROK_HOME') or Path.home() / '.grok')
+    if shutil.which('grok') or grok_home.is_dir():
+        settings = grok_home / 'config.toml'
+        try:
+            original = settings.read_bytes() if settings.is_file() else b''
+            data = tomllib.loads(original.decode('utf-8-sig'))
+            if 'status_line' not in data.get('ui', {}):
+                addition = '\n[ui.status_line]\ntype = "command"\ncommand = ' + json.dumps(
+                    command + ' --capture-grok-usage') + '\n'
+                grok_home.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile('wb', dir=grok_home, delete=False) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(original + addition.encode('utf-8'))
+                try:
+                    current = settings.read_bytes() if settings.is_file() else b''
+                    if current == original:
+                        temporary.replace(settings)
+                        messages.append('Reopen Grok to start collecting session usage')
+                finally:
+                    temporary.unlink(missing_ok=True)
+        except (OSError, ValueError, TypeError):
+            messages.append('Could not connect Grok session usage')
     return messages
 
 def clean(text):
@@ -129,6 +160,91 @@ def user_text(row):
     if text.lstrip().startswith(('<', '[Request interrupted', 'This session is being continued')):
         return ''
     return text.strip()
+
+
+def prompt_timestamp(value):
+    """Normalize ISO dates and epoch seconds/milliseconds/microseconds to seconds."""
+    try:
+        number = float(value)
+        while number > 100_000_000_000:
+            number /= 1000
+        return number if 0 < number < float('inf') else 0
+    except (ValueError, TypeError, OverflowError):
+        try:
+            date = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+            return date.replace(tzinfo=date.tzinfo or timezone.utc).timestamp()
+        except (ValueError, TypeError, OverflowError, OSError):
+            return 0
+
+
+class PromptTimes:
+    """Read prompt events incrementally, retaining timestamps through long tool runs."""
+    def __init__(self):
+        self.cache = {}
+
+    def read(self, path, provider):
+        if path is None:
+            return 0
+        path = Path(path)
+        previous = self.cache.get(path)
+        try:
+            st = path.stat()
+            key = st.st_mtime_ns, st.st_size
+            if previous and previous[0] == key:
+                return previous[2]
+            offset, latest = (previous[1], previous[2]) if previous and st.st_size > previous[0][1] else (0, 0)
+            with path.open('rb') as stream:
+                stream.seek(offset)
+                while line := stream.readline():
+                    if not line.endswith(b'\n'):
+                        break  # Retry incomplete records after the writer finishes.
+                    offset = stream.tell()
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    for stamp in self.events(row, provider):
+                        # Untimed events can be ordered once observed during a refresh.
+                        latest = max(latest, stamp or (time.time() if previous else 0))
+            self.cache[path] = key, offset, latest
+            return latest
+        except OSError:
+            return previous[2] if previous else 0
+
+    def events(self, row, provider, depth=0):
+        if not isinstance(row, dict) or depth > 8:
+            return
+        if row.get('retained_frame'):
+            for child in row.get('children') or []:
+                try:
+                    yield from self.events(json.loads(child['record_json']), provider, depth+1)
+                except (ValueError, TypeError, KeyError):
+                    continue
+            return
+        payload = row.get('payload') or {}
+        params = row.get('params') or {}
+        if not isinstance(payload, dict) or not isinstance(params, dict):
+            return
+        if provider == 'Claude':
+            is_prompt = bool(user_text(row))
+        elif provider == 'Codex':
+            is_prompt = (row.get('type') == 'event_msg' and payload.get('type') == 'user_message')
+        elif provider == 'Muse':
+            event = payload.get('event') or {}
+            is_prompt = (row.get('payload_type') == 'runtime.session' and
+                         isinstance(event, dict) and event.get('kind') == 'started' and bool(event.get('prompt')))
+        else:
+            update = params.get('update') or row.get('update') or {}
+            is_prompt = isinstance(update, dict) and update.get('sessionUpdate') == 'user_message_chunk'
+        if is_prompt:
+            yield prompt_timestamp(row.get('timestamp') or row.get('recorded_at') or params.get('timestamp'))
+
+
+def sort_sessions(sessions):
+    sessions.sort(key=lambda s: (-s.get('last_prompt_at', 0),
+                                 s.get('provider', '').casefold() if not s.get('last_prompt_at') else '',
+                                 s['directory'],
+                                 s.get('provider', ''), s.get('session', '')))
 
 def conversation_context(path):
     """Collect requests across the transcript, excluding tool results and injected context."""
@@ -274,6 +390,7 @@ class Summaries:
 class Tracker:
     def __init__(self, home=HOME, summaries=None):
         self.home, self.paths, self.cache = home, {}, {}
+        self.prompt_times = PromptTimes()
         self.summaries = summaries or Summaries()
 
     def details(self, record):
@@ -324,10 +441,13 @@ class Tracker:
                     continue
                 task, state, detail = self.details(r)
                 sessions.append(dict(provider='Claude', pid=r['pid'], session=r['sessionId'], name=clean(r.get('name', 'Claude')),
-                    directory=clean(r.get('cwd', 'Unknown')), task=task, activity=state, detail=detail))
+                    directory=clean(r.get('cwd', 'Unknown')), task=task, activity=state, detail=detail,
+                    last_prompt_at=self.prompt_times.read(self.paths.get(r['sessionId']), 'Claude'),
+                    message_log=str(self.paths[r['sessionId']]) if r['sessionId'] in self.paths else None))
             except (OSError, ValueError, KeyError, TypeError):
                 continue
-        return sorted(sessions, key=lambda s: (s['directory'], s['pid']))
+        sort_sessions(sessions)
+        return sessions
 
 def thread_locked(path):
     """Probe an existing lock without acquiring it or modifying the file."""
@@ -365,7 +485,7 @@ class AntigravityTracker:
                 db.row_factory = sqlite3.Row
                 placeholders = ','.join('?' for _ in ids)
                 rows = db.execute(
-                    'SELECT conversation_id, title, workspace_uris, not_fully_idle '
+                    'SELECT conversation_id, title, workspace_uris, not_fully_idle, last_user_input_time '
                     f'FROM conversation_summaries WHERE conversation_id IN ({placeholders})', ids)
                 summaries = {row['conversation_id']: dict(row) for row in rows}
         except sqlite3.Error:
@@ -386,7 +506,8 @@ class AntigravityTracker:
                 pass
             sessions.append(dict(provider='Antigravity', name='Antigravity', pid=None, session=sid,
                                  directory=directory, task=clean(summary.get('title') or 'Untitled chat'),
-                                 activity='working' if summary.get('not_fully_idle') else 'waiting', detail=''))
+                                 activity='working' if summary.get('not_fully_idle') else 'waiting', detail='',
+                                 last_prompt_at=prompt_timestamp(summary.get('last_user_input_time'))))
         return sessions
 
 
@@ -394,7 +515,9 @@ class CodexTracker:
     def __init__(self, home=None):
         self.home = Path(home or os.environ.get('CODEX_HOME', str(Path.home() / '.codex')))
         self.cache = {}
+        self.prompt_times = PromptTimes()
         self.error = ''
+        self.session_usage = CodexSessionUsage()
 
     def details(self, path):
         try:
@@ -475,8 +598,221 @@ class CodexTracker:
                 name=clean(r.get('agent_nickname') or r.get('name') or 'Codex'),
                 directory=clean(r['cwd'].removeprefix('\\\\?\\')),
                 task=clean(r.get('name') or r.get('title') or r.get('first_user_message') or 'Task not available'),
-                activity=state, detail=detail))
+                activity=state, detail=detail, usage=self.session_usage.read(Path(r['rollout_path'])),
+                last_prompt_at=self.prompt_times.read(Path(r['rollout_path']), 'Codex'),
+                message_log=r['rollout_path']))
         return sessions
+
+def json_file(path, default):
+    try:
+        return json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return default
+
+
+def transcript_rows(path):
+    """Stream complete logs for prompts, tolerating an incomplete final write."""
+    def unpack(row, depth=0):
+        if not isinstance(row, dict) or depth > 8:
+            return
+        if row.get('retained_frame'):
+            children = row.get('children') or []
+            if isinstance(children, list):
+                for child in children:
+                    if not isinstance(child, dict) or not isinstance(child.get('record_json'), str):
+                        continue
+                    try:
+                        yield from unpack(json.loads(child['record_json']), depth+1)
+                    except ValueError:
+                        continue
+        else:
+            yield row
+    try:
+        with path.open(encoding='utf-8', errors='replace') as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                    yield from unpack(row)
+                except ValueError:
+                    continue
+    except OSError:
+        return
+
+
+def tool_activity(call):
+    function = call.get('function') or call
+    name = str(function.get('name') or call.get('title') or 'tool')
+    args = function.get('arguments') or call.get('rawInput') or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            pass
+    detail = (args.get('file_path') or args.get('path') or args.get('command')
+              or args.get('cmd') or args.get('pattern') or '') if isinstance(args, dict) else args
+    return activity(name), clean(name + ': ' + str(detail))[:240]
+
+
+class MuseTracker:
+    """Muse's date-sharded event logs; only held .session.lock files are live."""
+    def __init__(self, home=None, summaries=None):
+        self.home = Path(home) if home is not None else Path(
+            os.environ.get('XDG_DATA_HOME') or Path.home() / '.local' / 'share') / 'muse'
+        self.summaries, self.cache, self.error = summaries, {}, ''
+        self.prompt_times = PromptTimes()
+        self.session_usage = MuseSessionUsage()
+
+    def details(self, path):
+        st = path.stat()
+        key = st.st_mtime_ns, st.st_size
+        if path in self.cache and self.cache[path][0] == key:
+            return self.cache[path][1]
+        directory, state, detail = 'Unknown', 'waiting', ''
+        prompts = []
+        for row in transcript_rows(path):
+            payload = row.get('payload')
+            if not isinstance(payload, dict):
+                continue
+            if row.get('payload_type') == 'runtime.session.metadata':
+                metadata = payload.get('record') or payload
+                if isinstance(metadata, dict):
+                    directory = clean(metadata.get('workspace_root') or directory)
+            if row.get('payload_type') != 'runtime.session':
+                continue
+            event = payload.get('event') or {}
+            if not isinstance(event, dict):
+                continue
+            kind = event.get('kind')
+            if kind == 'started':
+                prompt = event.get('prompt')
+                if isinstance(prompt, str) and prompt.strip():
+                    prompts.append(prompt[:5000])
+                    # Keep the objective and latest refinements without unbounded memory.
+                    if len(prompts) > 5:
+                        del prompts[1]
+                state, detail = 'thinking', ''
+            elif kind == 'assistant_tool_calls_committed':
+                calls = event.get('tool_calls') or []
+                if isinstance(calls, list) and calls and isinstance(calls[-1], dict):
+                    state, detail = tool_activity(calls[-1])
+            elif kind == 'assistant_message_committed':
+                state, detail = 'responding', ''
+            elif kind == 'terminal':
+                state, detail = 'waiting', ''
+        fallback = textwrap.shorten(clean(prompts[0] if prompts else 'Task not available'),
+                                    width=160, placeholder='…')
+        result = directory, '\n\n'.join(prompts), fallback, state, detail
+        self.cache[path] = key, result
+        return result
+
+    def scan(self):
+        self.error = ''
+        sessions = []
+        for lock in (self.home / 'sessions').glob('*/*/*/*/.session.lock'):
+            try:
+                if not thread_locked(lock):
+                    continue
+                path = lock.with_name('session.jsonl')
+                directory, context, fallback, state, detail = self.details(path)
+                sid = lock.parent.name
+                task = self.summaries.get('Muse:' + sid, context, fallback) if self.summaries else fallback
+                sessions.append(dict(provider='Muse', name='Muse', pid=None, session=sid,
+                                     directory=directory, task=task, activity=state, detail=detail,
+                                     usage=self.session_usage.get(sid),
+                                     last_prompt_at=self.prompt_times.read(path, 'Muse'), message_log=str(path)))
+            except (OSError, ValueError, TypeError, KeyError):
+                self.error = 'Muse session details temporarily unavailable'
+        return sessions
+
+
+class GrokTracker:
+    """Grok Build's active-session registry and ACP update stream (xai-org/grok-build)."""
+    def __init__(self, home=None):
+        self.home = Path(home or os.environ.get('GROK_HOME') or Path.home() / '.grok')
+        self.paths, self.cache, self.error = {}, {}, ''
+        self.prompt_times = PromptTimes()
+
+    def details(self, path):
+        try:
+            st = path.stat()
+        except OSError:
+            return 'waiting', '', ''
+        key = st.st_mtime_ns, st.st_size
+        if path in self.cache and self.cache[path][0] == key:
+            return self.cache[path][1]
+        state, detail, prompt = 'waiting', '', ''
+        for row in records(path, True):
+            if not isinstance(row, dict):
+                continue
+            params = row.get('params') or row
+            if not isinstance(params, dict):
+                continue
+            update = params.get('update') or {}
+            if not isinstance(update, dict):
+                continue
+            kind = update.get('sessionUpdate')
+            if kind == 'user_message_chunk':
+                content = update.get('content') or {}
+                if isinstance(content, dict) and content.get('type') == 'text':
+                    prompt = clean(content.get('text', '')) or prompt
+                state, detail = 'thinking', ''
+            elif kind == 'agent_thought_chunk':
+                state, detail = 'thinking', ''
+            elif kind == 'agent_message_chunk':
+                state, detail = 'responding', ''
+            elif kind in ('tool_call', 'tool_call_update'):
+                status = update.get('status')
+                if status in ('completed', 'failed'):
+                    state, detail = 'thinking', ''
+                elif status == 'pending':
+                    state, detail = 'waiting', clean(update.get('title', 'Tool approval'))
+                else:
+                    tool_kind = update.get('kind')
+                    state = {'read': 'reading', 'search': 'reading', 'edit': 'editing',
+                             'delete': 'editing', 'execute': 'running'}.get(tool_kind, 'working')
+                    detail = clean(update.get('title', ''))[:240]
+            elif kind in ('turn_completed', 'turn_cancelled', 'turn_failed'):
+                state, detail = 'waiting', ''
+        result = state, detail, prompt
+        self.cache[path] = key, result
+        return result
+
+    def scan(self):
+        self.error = ''
+        registry = json_file(self.home / 'active_sessions.json', [])
+        if not isinstance(registry, list):
+            self.error = 'Grok active-session registry temporarily unavailable'
+            return []
+        sessions, seen = [], set()
+        for record in registry:
+            try:
+                if not isinstance(record, dict) or not record.get('session_id') or not alive(record):
+                    continue
+                sid = record['session_id']
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                path = self.paths.get(sid)
+                if path is None or not path.is_dir():
+                    path = self.home / 'sessions' / quote(record.get('cwd', ''), safe='') / sid
+                    if not path.is_dir():
+                        path = next((self.home / 'sessions').glob('*/' + sid), path)
+                    self.paths[sid] = path
+                summary = json_file(path / 'summary.json', {})
+                if not isinstance(summary, dict):
+                    summary = {}
+                state, detail, prompt = self.details(path / 'updates.jsonl')
+                task = summary.get('generated_title') or summary.get('session_summary') or prompt or 'Task not available'
+                sessions.append(dict(provider='Grok', name=clean(summary.get('agent_name') or 'Grok'),
+                                     pid=record['pid'], session=sid, directory=clean(record.get('cwd') or 'Unknown'),
+                                     task=textwrap.shorten(clean(task), width=160, placeholder='…'),
+                                     activity=state, detail=detail,
+                                     last_prompt_at=self.prompt_times.read(path / 'updates.jsonl', 'Grok'),
+                                     message_log=str(path / 'updates.jsonl')))
+            except (OSError, ValueError, TypeError, KeyError):
+                self.error = 'Grok session details temporarily unavailable'
+        return sessions
+
 
 def mascot(state, frame):
     phase = frame % 4
@@ -512,36 +848,62 @@ def mascot(state, frame):
         arms = '    │  つ   │'
     return ['           ' + bubble, head, face, arms, '    ╰───────╯', feet]
 
-def render(sessions, frame, offset, width, height, notice='', usage=None, usage_navigation='', buttons=None):
-    lines = [ORANGE + '  CLAUDE' + RESET + ' + ' + BLUE + 'CODEX' + RESET + ' + ' + PURPLE + 'ANTIGRAVITY' + RESET + '   ' + str(len(sessions)) + ' live sessions',
-             DIM + ('  ' + usage_navigation + 'Up/Down scroll | PgUp/PgDn | Home/End | Ctrl+C exit')[:max(0, width - 1)] + RESET, '']
+def render(sessions, frame, offset, width, height, notice='', usage=None, buttons=None, navigating=None):
+    heading = ' + '.join(color + provider.upper() + RESET for provider, color in PROVIDER_COLORS.items())
+    lines = ['  ' + heading + '   ' + str(len(sessions)) + ' live sessions',
+             DIM + '  Right/Left Arrow: Switch through usage reports'[:max(0, width - 1)] + RESET,
+             DIM + '  Up/Down Arrow or Scroll Wheel: Scroll through active sessions'[:max(0, width - 1)] + RESET, '']
     if notice:
-        lines[2] = DIM + '  ' + notice[:max(0, width - 4)] + RESET
+        lines[3] = DIM + '  ' + notice[:max(0, width - 4)] + RESET
     if usage:
         lines.extend(usage)
         lines.append('')
     if not sessions:
         lines += ['  No active agent chats.', '  Start an agent in another terminal; it will appear here.']
     targets = []
-    for s in sessions:
-        text_width = max(0, width - 24)
-        provider = s.get('provider', 'Claude')
-        color = {'Codex': BLUE, 'Antigravity': PURPLE}.get(provider, ORANGE)
-        identity = f"PID {s['pid']}" if s.get('pid') else s['session'][:8]
-        task_lines = textwrap.wrap('Task: ' + s['task'], width=max(1, text_width), max_lines=2, placeholder='…')
-        button = '[Go to terminal]'
-        if text_width >= len(button) and s.get('session'):
-            targets.append((len(lines) + 2, 22, 22 + len(button), s))
-            control = color + button + RESET
-        else:
-            control = DIM + '─' * text_width + RESET
-        labels = [E + '1m' + f"{provider} · {s['name']} | {identity}"[:text_width] + RESET,
-                  s['directory'][:text_width], control,
-                  task_lines[0], task_lines[1] if len(task_lines) > 1 else '',
-                  s['activity'].upper() + ('  ' + s['detail'] if s['detail'] else '')]
-        for art, label in zip(mascot(s['activity'], frame), labels):
-            lines.append(color + art.ljust(22) + RESET + (label if '\x1b' in label else label[:text_width]))
-        lines += [DIM + '  ' + '━' * max(0, width - 5) + RESET, '']
+    for block in session_blocks(sessions):
+        boxed = len(block) > 1 and width >= 30
+        border = PROVIDER_COLORS.get(block[0].get('provider', 'Claude'), ORANGE)
+        if boxed:
+            title = ' Exchanged messages '
+            lines.append(' ' + border + '\u256d\u2500' + title + '\u2500' * max(0, width-5-len(title)) + '\u256e' + RESET)
+        for member_index, s in enumerate(block):
+            text_width = max(0, width - (28 if boxed else 24))
+            session_start = len(lines)
+            provider = s.get('provider', 'Claude')
+            color = PROVIDER_COLORS.get(provider, ORANGE)
+            identity = f"PID {s['pid']}" if s.get('pid') else s['session'][:8]
+            task_lines = textwrap.wrap('Task: ' + s['task'], width=max(1, text_width), max_lines=2, placeholder='…')
+            button = '[Go to terminal]'
+            is_navigating = navigating == (provider, s.get('session'))
+            if is_navigating:
+                control_lines = [color + part + RESET for part in textwrap.wrap(
+                    '[Navigating to terminal, please wait...]', width=max(1, text_width))]
+            elif text_width >= len(button) and s.get('session'):
+                targets.append((len(lines) + 2, (25 if boxed else 22), (25 if boxed else 22) + len(button), s))
+                control_lines = [color + button + RESET]
+            else:
+                control_lines = [DIM + '─' * text_width + RESET]
+            labels = [E + '1m' + f"{provider} · {s['name']} | {identity}"[:text_width] + RESET,
+                      s['directory'][:text_width], *control_lines,
+                      task_lines[0], task_lines[1] if len(task_lines) > 1 else '',
+                      s['activity'].upper() + ('  ' + s['detail'] if s['detail'] else '')]
+            for art, label in zip_longest(mascot(s['activity'], frame), labels, fillvalue=''):
+                lines.append(color + (fit_terminal(art, 22) if boxed else art.ljust(22)) + RESET + (label if '\x1b' in label else label[:text_width]))
+            for metric in session_metric_lines(s.get('usage') or {}):
+                for part in textwrap.wrap(metric, width=max(1, text_width)):
+                    lines.append(' ' * min(22, max(0, width - 2)) + DIM + part + RESET)
+            if boxed:
+                for row_index in range(session_start, len(lines)):
+                    lines[row_index] = (' ' + border + '\u2502 ' + RESET +
+                                        fit_terminal(lines[row_index], max(1, width-6)) + border + ' \u2502' + RESET)
+                if member_index + 1 < len(block):
+                    lines.append(' ' + border + '\u2502  ' + RESET + DIM +
+                                 '\u2500' * max(1, width-8) + RESET + border + '  \u2502' + RESET)
+            else:
+                lines += [DIM + '  ' + '\u2501' * max(0, width - 5) + RESET, '']
+        if boxed:
+            lines += [' ' + border + '\u2570' + '\u2500' * max(1, width-4) + '\u256f' + RESET, '']
     viewport = max(1, height - 1)
     offset = min(max(0, offset), max(0, len(lines) - viewport))
     if buttons is not None:
@@ -602,7 +964,8 @@ class ConsoleInput:
                 self.left_down = pressed
         return actions
 
-def main():
+def main(argv=None, preview=None):
+    """Run the dashboard, optionally using an injected, isolated preview snapshot."""
     parser = argparse.ArgumentParser(prog='agent-tracker', description='Local AI agent sessions and usage dashboard')
     parser.add_argument('--json', action='store_true', help='Print live sessions once as JSON')
     parser.add_argument('--demo', action='store_true', help='Preview with sample sessions')
@@ -610,8 +973,16 @@ def main():
     parser.add_argument('--usage-json', action='store_true', help='Print account usage without generating summaries')
     parser.add_argument('--setup-usage', action='store_true', help='Connect status-line usage collectors')
     parser.add_argument('--capture-antigravity-usage', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--capture-grok-usage', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--focus-agent', nargs=2, metavar=('PROVIDER', 'SESSION'), help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if preview is not None:
+        if any((args.demo, args.setup_usage, args.capture_claude_usage,
+                args.capture_antigravity_usage, args.capture_grok_usage, args.focus_agent)):
+            parser.error('Preview data cannot be combined with agent actions or --demo.')
+        if args.json or args.usage_json:
+            print(json.dumps(preview['usage'] if args.usage_json else preview['sessions'], indent=2))
+            return
     if args.focus_agent:
         from terminal_focus import focus_agent
         try:
@@ -635,33 +1006,47 @@ def main():
         except (OSError, ValueError, TypeError):
             pass
         return
-    if args.usage_json:
-        from usage import codex_usage
-        usage = Usage(HOME, codex_command, start=False)
+    if args.capture_grok_usage:
         try:
-            usage.data, usage.updated = codex_usage(codex_command()), time.time()
-        except Exception:
-            usage.error = 'refresh failed; check Codex login/network'
+            capture_claude(json.load(sys.stdin), Path(os.environ.get('GROK_HOME') or Path.home() / '.grok'))
+        except (OSError, ValueError, TypeError):
+            pass
+        return
+    if args.usage_json:
+        usage = Usage(HOME, codex_command, start=False)
+        usage.refresh_all()
         print(json.dumps(usage.snapshot(), indent=2))
         return
-    tracker = Tracker()
-    codex = CodexTracker()
-    antigravity = AntigravityTracker()
+    if preview is None:
+        tracker = Tracker()
+        codex = CodexTracker()
+        antigravity = AntigravityTracker()
+        muse = MuseTracker(summaries=tracker.summaries)
+        grok = GrokTracker()
     if args.json:
         sessions = tracker.scan()
+        muse.scan()
         tracker.summaries.jobs.join()
-        print(json.dumps(tracker.scan() + codex.scan() + antigravity.scan(), indent=2))
+        sessions = tracker.scan() + codex.scan() + antigravity.scan() + muse.scan() + grok.scan()
+        sort_sessions(sessions)
+        usage = Usage(HOME, codex_command, start=False)
+        usage.observe_sessions(sessions)
+        MessageGroups().update(sessions)
+        print(json.dumps(sessions, indent=2))
         if codex.error:
             print(codex.error, file=sys.stderr)
         if antigravity.error:
             print(antigravity.error, file=sys.stderr)
+        for backend in (muse, grok):
+            if backend.error:
+                print(backend.error, file=sys.stderr)
         if tracker.summaries.error:
             print(tracker.summaries.error, file=sys.stderr)
         return
     if not sys.stdout.isatty():
         parser.error('Use an interactive terminal, or pass --json.')
-    setup = configure_usage_collectors() if not args.demo else []
-    usage = Usage(HOME, codex_command, start=not args.demo)
+    setup = configure_usage_collectors() if preview is None and not args.demo else []
+    usage = Usage(HOME, codex_command, start=not args.demo) if preview is None else None
     k = ctypes.WinDLL('kernel32')
     k.GetStdHandle.restype = W.HANDLE
     k.GetConsoleMode.argtypes = [W.HANDLE, ctypes.POINTER(W.DWORD)]
@@ -684,36 +1069,45 @@ def main():
     buttons = []
     focus_job = None
     focus_notice = ''
+    focus_target = None
+    messaging = MessageGroups()
     try:
         sys.stdout.write(E + '?1049h' + E + '?25l' + E + '2J')
         while True:
-            if frame % 4 == 0:
+            if preview is not None:
+                sessions = preview['sessions']
+            elif frame % 4 == 0:
                 sessions = tracker.scan() if not args.demo else [dict(name='Claude demo', pid=100+i, directory=r'C:\Projects\example', task=t, activity=a, detail='') for i, (a,t) in enumerate([('reading','Investigate authentication flow'), ('editing','Add settings panel'), ('running','Run test suite'), ('thinking','Plan migration'), ('waiting','Waiting for next prompt')])]
                 if args.demo:
                     for i, session in enumerate(sessions):
-                        session['provider'] = ('Claude', 'Codex', 'Antigravity')[i % 3]
+                        session['provider'] = tuple(PROVIDER_COLORS)[i % len(PROVIDER_COLORS)]
                         session['name'] = session['provider'] + ' demo'
                 else:
-                    sessions += codex.scan() + antigravity.scan()
-                    sessions.sort(key=lambda s: (s['directory'], s.get('provider', ''), s['session']))
+                    sessions += codex.scan() + antigravity.scan() + muse.scan() + grok.scan()
+                    sort_sessions(sessions)
             width, height = shutil.get_terminal_size()
             if focus_job is not None and focus_job.poll() is not None:
                 _, error = focus_job.communicate()
                 focus_notice = clean(error) if focus_job.returncode else ''
                 focus_job = None
-            notice = ' | '.join(filter(None, (focus_notice, *setup, codex.error, antigravity.error, tracker.summaries.error)))
-            snapshot = usage.snapshot()
-            has_second_page = bool(snapshot['Gemini'] and (snapshot['Claude'] or snapshot['Codex']['data']))
-            if not has_second_page:
-                page = 0
-            navigation = ('Left: Claude / Codex | ' if page else 'Right: Gemini | ') if has_second_page else ''
+                focus_target = None
+            notice = preview['notice'] if preview is not None else ' | '.join(filter(None, (focus_notice, *setup, codex.error, antigravity.error, muse.error, grok.error, tracker.summaries.error)))
+            if preview is None and not args.demo and frame % 4 == 0:
+                usage.observe_sessions(sessions)
+                messaging.update(sessions)
+            snapshot = preview['usage'] if preview is not None else demo_usage() if args.demo else usage.snapshot()
+            pages = usage_pages(snapshot)
+            page = min(page, max(0, len(pages)-1))
             panels = usage_panels(snapshot, width, page=page)
-            output, offset = render(sessions, frame, offset, width, height, notice, panels, navigation, buttons)
+            output, offset = render(sessions, frame, offset, width, height, notice, panels, buttons,
+                                    navigating=focus_target)
             sys.stdout.write(E + 'H' + output)
             sys.stdout.flush()
             for _ in range(5):
                 for action in console.actions():
                     if isinstance(action, tuple) and action[0] == 'click':
+                        if preview is not None:
+                            continue  # Synthetic session IDs must never activate real terminals.
                         _, x, y = action
                         target = next((session for row, start, end, session in buttons
                                        if row == y and start <= x < end), None)
@@ -727,11 +1121,12 @@ def main():
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
                                     creationflags=subprocess.CREATE_NO_WINDOW)
                                 ctypes.WinDLL('user32').AllowSetForegroundWindow(focus_job.pid)
-                                focus_notice = 'Switching to agent terminal...'
+                                focus_target = (target['provider'], target['session'])
+                                focus_notice = ''
                             except OSError:
                                 focus_notice = 'Could not start terminal navigation'
                     elif action in ('left', 'right'):
-                        next_page = int(action == 'right' and has_second_page)
+                        next_page = min(max(0, page + (1 if action == 'right' else -1)), max(0, len(pages)-1))
                         if next_page != page:
                             page, offset = next_page, 0
                     elif action == 'home':
@@ -747,7 +1142,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        usage.stop.set()
+        if usage is not None:
+            usage.stop.set()
         k.SetConsoleTitleW(previous_title.value)
         sys.stdout.write(RESET + E + '?25h' + E + '?1049l')
         sys.stdout.flush()

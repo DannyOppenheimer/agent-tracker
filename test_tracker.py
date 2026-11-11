@@ -123,10 +123,10 @@ class TerminalButtonTests(unittest.TestCase):
         buttons = []
         output, _ = tracker.render([session]*4, 0, 0, 80, 12, buttons=buttons)
         self.assertIn('[Go to terminal]', output)
-        self.assertEqual(buttons[0][:3], (5, 22, 38))
+        self.assertEqual(buttons[0][:3], (6, 22, 38))
         tracker.render([session]*4, 0, 1, 80, 12, buttons=buttons)
-        self.assertEqual(buttons[0][:3], (4, 22, 38))
-        tracker.render([session]*4, 0, 6, 80, 12, buttons=buttons)
+        self.assertEqual(buttons[0][:3], (5, 22, 38))
+        tracker.render([session]*4, 0, 7, 80, 12, buttons=buttons)
         self.assertTrue(all(row >= 0 for row, _, _, _ in buttons))
         self.assertEqual(len(buttons), 1)
         tracker.render([session], 0, 0, 30, 20, buttons=buttons)
