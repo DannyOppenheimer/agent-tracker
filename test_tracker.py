@@ -116,6 +116,23 @@ class SummaryTests(unittest.TestCase):
         self.assertIn('\x1b[0mplacement\x1b[K', output)
 
 
+class TerminalButtonTests(unittest.TestCase):
+    def test_buttons_track_visible_rows_after_scrolling(self):
+        session = dict(provider='Claude', name='Example', pid=1, session='test', directory='Example',
+                       task='Task', activity='waiting', detail='')
+        buttons = []
+        output, _ = tracker.render([session]*4, 0, 0, 80, 12, buttons=buttons)
+        self.assertIn('[Go to terminal]', output)
+        self.assertEqual(buttons[0][:3], (5, 22, 38))
+        tracker.render([session]*4, 0, 1, 80, 12, buttons=buttons)
+        self.assertEqual(buttons[0][:3], (4, 22, 38))
+        tracker.render([session]*4, 0, 6, 80, 12, buttons=buttons)
+        self.assertTrue(all(row >= 0 for row, _, _, _ in buttons))
+        self.assertEqual(len(buttons), 1)
+        tracker.render([session], 0, 0, 30, 20, buttons=buttons)
+        self.assertEqual(buttons, [])
+
+
 class CodexTests(unittest.TestCase):
     def test_only_held_locks_are_live(self):
         with tempfile.TemporaryDirectory() as folder:

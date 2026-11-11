@@ -512,7 +512,7 @@ def mascot(state, frame):
         arms = '    │  つ   │'
     return ['           ' + bubble, head, face, arms, '    ╰───────╯', feet]
 
-def render(sessions, frame, offset, width, height, notice='', usage=None, usage_navigation=''):
+def render(sessions, frame, offset, width, height, notice='', usage=None, usage_navigation='', buttons=None):
     lines = [ORANGE + '  CLAUDE' + RESET + ' + ' + BLUE + 'CODEX' + RESET + ' + ' + PURPLE + 'ANTIGRAVITY' + RESET + '   ' + str(len(sessions)) + ' live sessions',
              DIM + ('  ' + usage_navigation + 'Up/Down scroll | PgUp/PgDn | Home/End | Ctrl+C exit')[:max(0, width - 1)] + RESET, '']
     if notice:
@@ -522,14 +522,21 @@ def render(sessions, frame, offset, width, height, notice='', usage=None, usage_
         lines.append('')
     if not sessions:
         lines += ['  No active agent chats.', '  Start an agent in another terminal; it will appear here.']
+    targets = []
     for s in sessions:
         text_width = max(0, width - 24)
         provider = s.get('provider', 'Claude')
         color = {'Codex': BLUE, 'Antigravity': PURPLE}.get(provider, ORANGE)
         identity = f"PID {s['pid']}" if s.get('pid') else s['session'][:8]
         task_lines = textwrap.wrap('Task: ' + s['task'], width=max(1, text_width), max_lines=2, placeholder='…')
+        button = '[Go to terminal]'
+        if text_width >= len(button) and s.get('session'):
+            targets.append((len(lines) + 2, 22, 22 + len(button), s))
+            control = color + button + RESET
+        else:
+            control = DIM + '─' * text_width + RESET
         labels = [E + '1m' + f"{provider} · {s['name']} | {identity}"[:text_width] + RESET,
-                  s['directory'][:text_width], DIM + '─' * text_width + RESET,
+                  s['directory'][:text_width], control,
                   task_lines[0], task_lines[1] if len(task_lines) > 1 else '',
                   s['activity'].upper() + ('  ' + s['detail'] if s['detail'] else '')]
         for art, label in zip(mascot(s['activity'], frame), labels):
@@ -537,6 +544,9 @@ def render(sessions, frame, offset, width, height, notice='', usage=None, usage_
         lines += [DIM + '  ' + '━' * max(0, width - 5) + RESET, '']
     viewport = max(1, height - 1)
     offset = min(max(0, offset), max(0, len(lines) - viewport))
+    if buttons is not None:
+        buttons[:] = [(row-offset, start, end, session) for row, start, end, session in targets
+                      if offset <= row < offset + viewport]
     return '\r\n'.join(line + E + 'K' for line in lines[offset:offset + viewport]) + E + 'J', offset
 
 
@@ -559,6 +569,7 @@ class ConsoleInput:
         kernel.GetNumberOfConsoleInputEvents.argtypes = [W.HANDLE, ctypes.POINTER(W.DWORD)]
         kernel.ReadConsoleInputW.argtypes = [W.HANDLE, ctypes.POINTER(Event), W.DWORD, ctypes.POINTER(W.DWORD)]
         self.wheel = 0
+        self.left_down = False
 
     def actions(self):
         count = W.DWORD()
@@ -583,6 +594,12 @@ class ConsoleInput:
                 while abs(self.wheel) >= 120:
                     actions.extend(['up' if self.wheel > 0 else 'down'] * 3)
                     self.wheel += -120 if self.wheel > 0 else 120
+            elif event.kind == 2:
+                mouse = event.data.mouse
+                pressed = bool(mouse.buttons & 1)
+                if pressed and not self.left_down and mouse.flags == 0:
+                    actions.append(('click', mouse.x, mouse.y))
+                self.left_down = pressed
         return actions
 
 def main():
@@ -593,7 +610,16 @@ def main():
     parser.add_argument('--usage-json', action='store_true', help='Print account usage without generating summaries')
     parser.add_argument('--setup-usage', action='store_true', help='Connect status-line usage collectors')
     parser.add_argument('--capture-antigravity-usage', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--focus-agent', nargs=2, metavar=('PROVIDER', 'SESSION'), help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.focus_agent:
+        from terminal_focus import focus_agent
+        try:
+            focus_agent(*args.focus_agent)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            print(str(error), file=sys.stderr)
+            raise SystemExit(1)
+        return
     if args.setup_usage:
         print('\n'.join(configure_usage_collectors()) or 'No status-line changes needed.')
         return
@@ -655,6 +681,9 @@ def main():
     k.GetConsoleTitleW(previous_title, len(previous_title))
     k.SetConsoleTitleW('AI Agent Tracker')
     frame = offset = page = 0
+    buttons = []
+    focus_job = None
+    focus_notice = ''
     try:
         sys.stdout.write(E + '?1049h' + E + '?25l' + E + '2J')
         while True:
@@ -668,19 +697,40 @@ def main():
                     sessions += codex.scan() + antigravity.scan()
                     sessions.sort(key=lambda s: (s['directory'], s.get('provider', ''), s['session']))
             width, height = shutil.get_terminal_size()
-            notice = ' | '.join(filter(None, (*setup, codex.error, antigravity.error, tracker.summaries.error)))
+            if focus_job is not None and focus_job.poll() is not None:
+                _, error = focus_job.communicate()
+                focus_notice = clean(error) if focus_job.returncode else ''
+                focus_job = None
+            notice = ' | '.join(filter(None, (focus_notice, *setup, codex.error, antigravity.error, tracker.summaries.error)))
             snapshot = usage.snapshot()
             has_second_page = bool(snapshot['Gemini'] and (snapshot['Claude'] or snapshot['Codex']['data']))
             if not has_second_page:
                 page = 0
             navigation = ('Left: Claude / Codex | ' if page else 'Right: Gemini | ') if has_second_page else ''
             panels = usage_panels(snapshot, width, page=page)
-            output, offset = render(sessions, frame, offset, width, height, notice, panels, navigation)
+            output, offset = render(sessions, frame, offset, width, height, notice, panels, navigation, buttons)
             sys.stdout.write(E + 'H' + output)
             sys.stdout.flush()
             for _ in range(5):
                 for action in console.actions():
-                    if action in ('left', 'right'):
+                    if isinstance(action, tuple) and action[0] == 'click':
+                        _, x, y = action
+                        target = next((session for row, start, end, session in buttons
+                                       if row == y and start <= x < end), None)
+                        if target is not None and focus_job is None:
+                            command = [sys.executable]
+                            if not getattr(sys, 'frozen', False):
+                                command.append(str(Path(__file__).resolve()))
+                            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1')
+                            try:
+                                focus_job = subprocess.Popen(command + ['--focus-agent', target['provider'], target['session']],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+                                ctypes.WinDLL('user32').AllowSetForegroundWindow(focus_job.pid)
+                                focus_notice = 'Switching to agent terminal...'
+                            except OSError:
+                                focus_notice = 'Could not start terminal navigation'
+                    elif action in ('left', 'right'):
                         next_page = int(action == 'right' and has_second_page)
                         if next_page != page:
                             page, offset = next_page, 0

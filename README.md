@@ -38,10 +38,17 @@ Integrate a collector into your existing status-line script by passing the same 
 
 These commands expect JSON on stdin and emit a short status message. Your script can retain its own display output. Claude settings are in `%USERPROFILE%\.claude\settings.json`, or the directory selected by `CLAUDE_CONFIG_DIR`. Antigravity settings are in `%USERPROFILE%\.gemini\antigravity-cli\settings.json`.
 
+## Switch to an agent terminal
+
+Click **[Go to terminal]** beside a chat to activate its terminal window or select its Windows Terminal tab. The tracker resolves Claude's live PID or the process holding a Codex/Antigravity session lock. Navigation runs in a helper process so the dashboard keeps responding.
+
+Windows Terminal must allow application title changes. The helper temporarily assigns the target console a unique title to find its tab through Windows UI Automation, then restores the previous title. This works with ordinary terminal tabs and classic console windows. Manually renamed tabs, suppressed application titles, split panes, embedded IDE terminals, desktop app chats, and elevated agents may prevent exact selection. A message appears in the dashboard when selection fails. Run the tracker and agents at the same elevation level.
+
 ## Controls
 
 | Control | Action |
 | --- | --- |
+| Click [Go to terminal] | Activate the chat?s terminal tab or window |
 | Right Arrow | Show Gemini usage when a second usage page is available |
 | Left Arrow | Return to Claude / Codex usage |
 | Up / Down | Scroll one line |
@@ -103,6 +110,7 @@ Source runs cache task titles and request hashes in `task-summaries.json` beside
 ## Source files
 
 - `tracker.py` contains session detection, terminal input, mascots, and the dashboard.
+- `terminal_focus.py` contains process lookup and terminal activation.
 - `usage.py` contains status-line collection, account usage retrieval, and usage cards.
 - `test_tracker.py` and `test_usage.py` contain the tests.
 - `build-windows.ps1` creates the portable Windows archive.
