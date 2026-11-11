@@ -40,9 +40,9 @@ These commands expect JSON on stdin and emit a short status message. Your script
 
 ## Switch to an agent terminal
 
-Click **[Go to terminal]** beside a chat to activate its terminal window or select its Windows Terminal tab. The tracker resolves Claude's live PID or the process holding a Codex/Antigravity session lock. Navigation runs in a helper process so the dashboard keeps responding.
+Click **[Go to terminal]** beside a chat to activate its terminal window or select its Windows Terminal tab. The tracker resolves Claude and Grok live PIDs and the processes holding Codex, Antigravity, and Muse session locks. Navigation runs in a helper process so the dashboard keeps responding.
 
-Windows Terminal must allow application title changes. The helper temporarily assigns the target console a unique title to find its tab through Windows UI Automation, then restores the previous title. This works with ordinary terminal tabs and classic console windows. Manually renamed tabs, suppressed application titles, split panes, embedded IDE terminals, desktop app chats, and elevated agents may prevent exact selection. A message appears in the dashboard when selection fails. Run the tracker and agents at the same elevation level.
+Windows Terminal must allow application title changes. The helper temporarily assigns the target console a unique title to find its tab through Windows UI Automation, then restores the previous title. All five agents use the same terminal activation path for ordinary terminal tabs and classic console windows. Codex app chats also attempt to select a uniquely matching chat title through Windows UI Automation. Manually renamed tabs, suppressed application titles, split panes, embedded IDE terminals, hidden or ambiguous app sidebar entries, and elevated agents may prevent exact selection. A message appears in the dashboard when selection fails. Run the tracker and agents at the same elevation level.
 
 ## Controls
 

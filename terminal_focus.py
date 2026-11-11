@@ -9,6 +9,10 @@ import time
 import uuid
 
 
+class NoConsole(RuntimeError):
+    pass
+
+
 class UniqueProcess(ctypes.Structure):
     _fields_ = [('pid', W.DWORD), ('started', W.FILETIME)]
 
@@ -48,7 +52,8 @@ def console_processes(pid):
         kernel.CloseHandle(handle)
     result = [pid]
     # Do not walk into IDE/app hosts or unrelated shells above the frontend.
-    frontends = {'agy.exe', 'claude.exe', 'codex.exe', 'node.exe'}
+    frontends = {'agy.exe', 'claude.exe', 'codex.exe', 'node.exe',
+                 'muse.exe', 'muse-code.exe', 'grok.exe', 'grok-build.exe', 'chatgpt.exe'}
     parent = processes.get(pid, (0, ''))[0]
     while parent not in result and processes.get(parent, (0, ''))[1] in frontends:
         result.append(parent)
@@ -104,6 +109,34 @@ for ($attempt = 0; $attempt -lt 8; $attempt++) {
     $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children,
         [System.Windows.Automation.Condition]::TrueCondition)
     foreach ($window in $windows) {
+        if ($env:AGENT_TRACKER_APP_PIDS) {
+            $owners = $env:AGENT_TRACKER_APP_PIDS | ConvertFrom-Json
+            if (($window.Current.ProcessId -notin $owners) -and
+                ($window.Current.Name -notmatch '^(Codex|ChatGPT)(\s|$)')) { continue }
+            $condition = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                $env:AGENT_TRACKER_CHAT_TITLE)
+            $elements = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+            $targets = @()
+            foreach ($element in $elements) {
+                $patterns = $element.GetSupportedPatterns()
+                if (($patterns -contains [System.Windows.Automation.InvokePattern]::Pattern) -or
+                    ($patterns -contains [System.Windows.Automation.SelectionItemPattern]::Pattern)) {
+                    $targets += $element
+                }
+            }
+            if ($targets.Count -ne 1) { continue }
+            $handle = [IntPtr]$window.Current.NativeWindowHandle
+            [void][AgentTrackerWindow]::ShowWindowAsync($handle, 9)
+            $patterns = $targets[0].GetSupportedPatterns()
+            if ($patterns -contains [System.Windows.Automation.SelectionItemPattern]::Pattern) {
+                $targets[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+            } else {
+                $targets[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            }
+            if (-not [AgentTrackerWindow]::SetForegroundWindow($handle)) { exit 3 }
+            exit 0
+        }
         if ($window.Current.ClassName -ne 'CASCADIA_HOSTING_WINDOW_CLASS') { continue }
         $tabs = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabCondition)
         foreach ($tab in $tabs) {
@@ -124,6 +157,30 @@ exit 2
 '''
 
 
+def select_host(environment):
+    powershell = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    encoded = base64.b64encode(SELECT_TAB.encode('utf-16-le')).decode('ascii')
+    with subprocess.Popen([str(powershell), '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                          env=dict(os.environ, **environment), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          creationflags=subprocess.CREATE_NO_WINDOW) as child:
+        ctypes.WinDLL('user32').AllowSetForegroundWindow(child.pid)
+        try:
+            child.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+            raise RuntimeError('Agent window selection timed out')
+    return child.returncode == 0
+
+
+def focus_app_chat(pid, title):
+    import json
+    if title and select_host(dict(AGENT_TRACKER_APP_PIDS=json.dumps(console_processes(pid)),
+                                  AGENT_TRACKER_CHAT_TITLE=title)):
+        return
+    raise RuntimeError('Could not uniquely select this chat in the app. Keep its sidebar visible and check elevation levels')
+
+
 def focus_console(pid):
     """Run only in a helper process so attaching cannot detach the dashboard."""
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -138,7 +195,7 @@ def focus_console(pid):
     kernel.FreeConsole()
     attached = any(kernel.AttachConsole(candidate) for candidate in console_processes(pid))
     if not attached:
-        raise RuntimeError('This agent has no accessible terminal console (it may be in an app or have closed)')
+        raise NoConsole('This agent has no accessible terminal console (it may be in an app or have closed)')
     previous = ctypes.create_unicode_buffer(32768)
     kernel.GetConsoleTitleW(previous, len(previous))
     changed = False
@@ -155,20 +212,7 @@ def focus_console(pid):
             raise RuntimeError('Could not identify the terminal tab')
         changed = True
         time.sleep(.15)
-        powershell = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
-        encoded = base64.b64encode(SELECT_TAB.encode('utf-16-le')).decode('ascii')
-        with subprocess.Popen([str(powershell), '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-                              env=dict(os.environ, AGENT_TRACKER_FOCUS_TITLE=marker),
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              creationflags=subprocess.CREATE_NO_WINDOW) as child:
-            user.AllowSetForegroundWindow(child.pid)
-            try:
-                child.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
-                raise RuntimeError('Terminal tab selection timed out')
-        if child.returncode:
+        if not select_host(dict(AGENT_TRACKER_FOCUS_TITLE=marker)):
             raise RuntimeError('Could not select this tab. Use Windows Terminal with application titles enabled; check elevation levels')
     finally:
         if changed:
@@ -186,20 +230,41 @@ def focus_agent(provider, sid):
     from usage import antigravity_home
     if not sid or any(character not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-' for character in sid):
         raise RuntimeError('Invalid session identifier')
-    if provider == 'Claude':
-        for path in (HOME / 'sessions').glob('*.json'):
+    if provider in ('Claude', 'Grok'):
+        if provider == 'Claude':
+            records = []
+            for path in (HOME / 'sessions').glob('*.json'):
+                try:
+                    records.append(json.loads(path.read_text(encoding='utf-8')))
+                except (OSError, ValueError):
+                    continue
+            id_key = 'sessionId'
+        else:
+            home = Path(os.environ.get('GROK_HOME') or Path.home() / '.grok')
             try:
-                record = json.loads(path.read_text(encoding='utf-8'))
-                if record.get('sessionId') == sid and alive(record):
+                records = json.loads((home / 'active_sessions.json').read_text(encoding='utf-8-sig'))
+            except (OSError, ValueError):
+                records = []
+            if not isinstance(records, list):
+                records = []
+            id_key = 'session_id'
+        for record in records:
+            try:
+                if isinstance(record, dict) and record.get(id_key) == sid and alive(record):
                     focus_console(int(record['pid']))
                     return
             except (OSError, ValueError, TypeError, KeyError):
                 continue
-        raise RuntimeError('This Claude session has closed')
+        raise RuntimeError(f'This {provider} session has closed')
     if provider == 'Codex':
         lock = CodexTracker().home / 'thread-writer-locks' / (sid + '.lock')
     elif provider == 'Antigravity':
         lock = antigravity_home() / 'presence' / (sid + '.lock')
+    elif provider == 'Muse':
+        home = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local' / 'share') / 'muse'
+        lock = next((home / 'sessions').glob('*/*/*/' + sid + '/.session.lock'), None)
+        if lock is None:
+            raise RuntimeError('This Muse session has closed')
     else:
         raise RuntimeError('This preview has no terminal')
     if not thread_locked(lock):
@@ -207,4 +272,10 @@ def focus_agent(provider, sid):
     owners = file_owners(lock)
     if len(owners) != 1:
         raise RuntimeError('Could not uniquely identify the agent terminal process')
-    focus_console(owners[0])
+    try:
+        focus_console(owners[0])
+    except NoConsole:
+        if provider != 'Codex':
+            raise
+        session = next((item for item in CodexTracker().scan() if item['session'] == sid), {})
+        focus_app_chat(owners[0], session.get('task'))
