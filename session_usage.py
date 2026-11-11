@@ -168,8 +168,9 @@ class MuseSessionUsage:
             if command:
                 metrics = read_muse_session(command, sid)
                 metrics['updated_at'] = time.time()
-        except (OSError, ValueError, RuntimeError, TimeoutError, queue.Empty, subprocess.SubprocessError):
-            pass
+        except Exception:
+            # A traceback from this daemon thread would print over the full-screen UI.
+            metrics = None
         finally:
             with self.lock:
                 if metrics is None:

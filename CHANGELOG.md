@@ -18,7 +18,9 @@ Changes since v0.1.0, including the terminal-navigation commits already on main.
 
 - Order sessions by latest user prompt across providers and folders; replies and tool activity do not move chats to the top.
 - Keep account usage separate from individual session metrics. Missing amounts remain unavailable, and zero remains zero; token counts and subscription percentages are not converted into dollar costs.
-- Extend background task summaries to Muse and discover Muse/Grok launchers in standard Windows install locations when PATH is stale.
+- Replace background `codex exec` task summaries with titles that cost nothing and stay local: Claude uses `/rename` titles, then Claude Code's own `ai-title`; Muse and untitled Claude chats use an offline request extractor (`titles.py`). Chat text is no longer sent to Codex, and no title cache is written.
+- Discover Muse/Grok launchers in standard Windows install locations when PATH is stale.
+- Read Claude transcript titles incrementally instead of re-reading the whole transcript on every change.
 - Document provider setup, usage states, grouping detection limits, development scenarios, and extension points.
 
 ### Fixed
@@ -27,10 +29,13 @@ Changes since v0.1.0, including the terminal-navigation commits already on main.
 - Locate Windows Terminal tabs even when their pseudoconsole window is visible; support Codex's shared background server through exact session-title/folder matching, including working spinners.
 - Preserve maximized and fullscreen windows while restoring minimized windows; reject ambiguous navigation matches.
 - Display navigation progress inside the clicked session's button, including wrapped and scrolled grouped sessions.
+- Never write an invalid Grok `config.toml` when connecting the status line (for example when `ui` is an inline table).
+- Infinite timestamps in agent logs no longer hang the dashboard.
+- A provider scan that hits unexpected data shows a notice instead of closing the dashboard; Muse background reads no longer print tracebacks over the display.
 
 ### Validation and distribution
 
-- 86 automated tests cover session detection, prompt order, usage adapters and cards, CLI protocols, session metrics, message groups, navigation, and development scenarios.
+- 92 automated tests cover session detection, prompt order, task titles, usage adapters and cards, CLI protocols, session metrics, message groups, navigation, and development scenarios.
 - Portable Windows x64 ZIP with Python bundled. Development scenarios are excluded from the normal executable.
 - Windows 10/11 x64 remains the target; a separate clean Windows installation, 32-bit Windows, and ARM64 Windows have not been verified.
 

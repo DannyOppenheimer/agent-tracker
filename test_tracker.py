@@ -11,102 +11,91 @@ import tracker
 
 
 class SummaryTests(unittest.TestCase):
-    def test_codex_summary_uses_ephemeral_read_only_run_and_stdin(self):
-        def run(args, **kwargs):
-            self.assertIn('--ephemeral', args)
-            self.assertIn('--ignore-user-config', args)
-            self.assertEqual(args[args.index('--sandbox') + 1], 'read-only')
-            self.assertEqual(kwargs['input'], 'Original task plus refinements')
-            self.assertEqual(args[-1], '-')
-            self.assertNotIn('shell', kwargs)
-            Path(args[args.index('-o') + 1]).write_text('Fix darkroom lighting and door', encoding='utf-8')
-            return SimpleNamespace(returncode=0)
-        with patch.object(tracker, 'codex_command', return_value=['codex.exe']), patch.object(tracker.subprocess, 'run', side_effect=run):
-            self.assertEqual(tracker.generate_summary('Original task plus refinements'), 'Fix darkroom lighting and door')
+    def test_infinite_timestamps_do_not_hang(self):
+        from message_groups import stamp
+        self.assertEqual(tracker.prompt_timestamp('1e999'), 0)
+        self.assertEqual(tracker.prompt_timestamp(float('inf')), 0)
+        self.assertEqual(stamp(float('inf')), 0)
+        self.assertEqual(tracker.prompt_timestamp(1_700_000_000_000), 1_700_000_000)
 
-    def test_claude_cache_is_regenerated_by_codex(self):
+    def test_scanner_failure_becomes_notice_not_crash(self):
+        class Broken:
+            error = ''
+            def scan(self):
+                raise AttributeError('unexpected row')
+        class Working:
+            error = ''
+            def scan(self):
+                return [dict(provider='Codex', directory='C:/x', session='s')]
+        broken = Broken()
+        sessions = tracker.scan_all([(broken, 'Claude'), (Working(), 'Codex')])
+        self.assertEqual([s['session'] for s in sessions], ['s'])
+        self.assertIn('Claude', broken.error)
+
+    def test_grok_setup_never_writes_invalid_toml(self):
+        import tempfile, tomllib
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'cache.json'
-            context = 'Build camera animations'
-            path.write_text(json.dumps({'session': dict(
-                digest=tracker.hashlib.sha256(context.encode()).hexdigest(), summary='Old Claude title')}), encoding='utf-8')
-            calls = []
-            def generate(text):
-                calls.append(text)
-                return 'Codex title'
-            summaries = tracker.Summaries(path, generate)
-            summaries.get('session', context, 'Fallback')
-            summaries.jobs.join()
-            self.assertEqual(calls, [context])
-            self.assertEqual(summaries.get('session', context, 'Fallback'), 'Codex title')
+            home = Path(folder)
+            config = home / 'config.toml'
+            config.write_text('ui = { theme = "dark" }\n', encoding='utf-8')
+            with patch.dict(tracker.os.environ, GROK_HOME=folder), \
+                 patch.object(tracker, 'HOME', home / 'missing-claude'), \
+                 patch.object(tracker, 'antigravity_home', return_value=home / 'missing-agy'), \
+                 patch.object(tracker.shutil, 'which', return_value=None):
+                messages = tracker.configure_usage_collectors()
+            self.assertEqual(config.read_text(encoding='utf-8'), 'ui = { theme = "dark" }\n')
+            self.assertTrue(any('manually' in m for m in messages))
+            config.write_text('[ui]\ntheme = "dark"\n', encoding='utf-8')
+            with patch.dict(tracker.os.environ, GROK_HOME=folder), \
+                 patch.object(tracker, 'HOME', home / 'missing-claude'), \
+                 patch.object(tracker, 'antigravity_home', return_value=home / 'missing-agy'), \
+                 patch.object(tracker.shutil, 'which', return_value=None):
+                tracker.configure_usage_collectors()
+            data = tomllib.loads(config.read_text(encoding='utf-8'))
+            self.assertEqual(data['ui']['theme'], 'dark')
+            self.assertEqual(data['ui']['status_line']['type'], 'command')
 
-    def test_whole_conversation_survives_large_tool_output_and_followup(self):
+    def test_title_priority_rename_then_claude_ai_title_then_offline(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'session.jsonl'
-            rows = [dict(type='user', message=dict(content='Create film camera animations for loading, advancing and focusing.')),
+            rows = [dict(type='user', message=dict(content='This is a Unity project. Please fix the darkroom door.')),
                     dict(type='assistant', message=dict(content='x' * 300000)),
                     dict(type='user', isMeta=True, message=dict(content='Injected instructions')),
-                    dict(type='user', message=dict(content=[dict(type='tool_result', content='Ignore this')])),
-                    dict(type='user', message=dict(content='Try again to complete the task'))]
-            path.write_text('\n'.join(map(json.dumps, rows)), encoding='utf-8')
-            context, fallback = tracker.conversation_context(path)
-            self.assertIn('Create film camera animations', context)
-            self.assertIn('Try again', context)
-            self.assertNotIn('Injected instructions', context)
-            self.assertNotIn('Ignore this', context)
-            self.assertTrue(fallback.startswith('Create film camera'))
+                    dict(type='user', message=dict(content=[dict(type='tool_result', content='Ignore this')]))]
+            path.write_text('\n'.join(map(json.dumps, rows)) + '\n', encoding='utf-8')
+            titles = tracker.TranscriptTitles()
+            self.assertEqual(titles.read(path), 'Fix the darkroom door')
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(dict(type='summary', summary='Compaction summary')) + '\n')
+                stream.write(json.dumps(dict(type='ai-title', aiTitle='Darkroom door')) + '\n')
+            self.assertEqual(titles.read(path), 'Darkroom door')
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(dict(type='ai-title', aiTitle='Darkroom door and lighting')) + '\n')
+            self.assertEqual(titles.read(path), 'Darkroom door and lighting')
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(dict(type='custom-title', customTitle='Animate the camera')) + '\n')
+                stream.write(json.dumps(dict(type='ai-title', aiTitle='A later AI title')) + '\n')
+            self.assertEqual(titles.read(path), 'Animate the camera')
 
-    def test_saved_title_takes_precedence_over_compaction_summary(self):
+    def test_title_waits_for_unfinished_record(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'session.jsonl'
-            path.write_text('\n'.join(map(json.dumps, [
-                dict(type='custom-title', customTitle='Animate the camera'),
-                dict(type='summary', summary='A later compaction summary')])), encoding='utf-8')
-            self.assertEqual(tracker.conversation_context(path)[1], 'Animate the camera')
+            path.write_text('{"type": "ai-title", "aiTi', encoding='utf-8')
+            titles = tracker.TranscriptTitles()
+            self.assertEqual(titles.read(path), 'Task not available')
+            path.write_text('{"type": "ai-title", "aiTitle": "Finished"}', encoding='utf-8')
+            self.assertEqual(titles.read(path), 'Finished')
 
-    def test_summaries_cached_across_refreshes_and_restarts(self):
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'cache.json'
-            calls = []
-            def generate(context):
-                calls.append(context)
-                return 'Fix darkroom lighting, door placement and hand animation'
-            summaries = tracker.Summaries(path, generate)
-            summaries.get('session', 'Original request', 'Fallback')
-            summaries.jobs.join()
-            expected = 'Fix darkroom lighting, door placement and hand animation'
-            self.assertEqual(summaries.get('session', 'Original request', 'Fallback'), expected)
-            restarted = tracker.Summaries(path, generate)
-            self.assertEqual(restarted.get('session', 'Original request', 'Fallback'), expected)
-            self.assertEqual(calls, ['Original request'])
-            restarted.get('session', 'Original request plus followup', 'Fallback')
-            restarted.jobs.join()
-            self.assertEqual(len(calls), 2)
-
-    def test_failure_keeps_fallback_and_does_not_retry_every_frame(self):
-        with tempfile.TemporaryDirectory() as folder:
-            calls = []
-            def fail(context):
-                calls.append(context)
-                raise RuntimeError('Offline')
-            summaries = tracker.Summaries(Path(folder) / 'cache.json', fail)
-            summaries.get('session', 'Task', 'Original task')
-            summaries.jobs.join()
-            self.assertEqual(summaries.get('session', 'Task', 'Original task'), 'Original task')
-            self.assertEqual(calls, ['Task'])
-
-    def test_background_result_replaces_fallback_without_transcript_changes(self):
+    def test_claude_session_uses_transcript_title(self):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
             project = home / 'projects' / 'example'
             project.mkdir(parents=True)
-            (project / 'session.jsonl').write_text(json.dumps(dict(
-                type='user', message=dict(content='Fix lighting and the darkroom door.'))), encoding='utf-8')
-            summaries = tracker.Summaries(home / 'cache.json', lambda _: 'Fix darkroom lighting and door')
-            backend = tracker.Tracker(home, summaries)
-            backend.details(dict(sessionId='session'))
-            summaries.jobs.join()
-            self.assertEqual(backend.details(dict(sessionId='session'))[0], 'Fix darkroom lighting and door')
+            (project / 'session.jsonl').write_text('\n'.join(map(json.dumps, [
+                dict(type='user', message=dict(content='Fix lighting and the darkroom door.')),
+                dict(type='ai-title', aiTitle='Darkroom lighting and door')])) + '\n', encoding='utf-8')
+            backend = tracker.Tracker(home)
+            self.assertEqual(backend.details(dict(sessionId='session'))[0], 'Darkroom lighting and door')
 
     def test_task_wraps_into_spare_line(self):
         session = dict(provider='Claude', name='Example', pid=1, session='test', directory='Example',

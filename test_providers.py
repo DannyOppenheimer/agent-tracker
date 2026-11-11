@@ -35,9 +35,8 @@ class MuseTests(unittest.TestCase):
                 dict(child_index=0, record_json=json.dumps(prompt)),
                 dict(child_index=1, record_json='{incomplete')])
             write_rows(path, [metadata, frame])
-            directory, context, task, state, detail = tracker.MuseTracker(folder).details(path)
+            directory, task, state, detail = tracker.MuseTracker(folder).details(path)
             self.assertEqual(directory, r'C:\Project')
-            self.assertEqual(context, 'Fix the camera')
             self.assertEqual(task, 'Fix the camera')
             self.assertEqual(state, 'thinking')
 
@@ -52,9 +51,7 @@ class MuseTests(unittest.TestCase):
             write_rows(path, rows)
             lock = path.with_name('.session.lock')
             lock.write_bytes(b'pid=123\n')
-            summaries = Mock()
-            summaries.get.return_value = 'Repair camera movement'
-            backend = tracker.MuseTracker(root, summaries)
+            backend = tracker.MuseTracker(root)
             backend.session_usage = Mock()
             backend.session_usage.get.return_value = {}
             self.assertEqual(backend.scan(), [])
@@ -66,8 +63,7 @@ class MuseTests(unittest.TestCase):
                     self.assertEqual(session['directory'], r'C:\Project')
                     self.assertEqual(session['activity'], 'editing')
                     self.assertIn('camera.py', session['detail'])
-                    self.assertEqual(session['task'], 'Repair camera movement')
-                    summaries.get.assert_called_with('Muse:live', 'Fix the camera', 'Fix the camera')
+                    self.assertEqual(session['task'], 'Fix the camera')
                 finally:
                     owner.seek(0)
                     msvcrt.locking(owner.fileno(), msvcrt.LK_UNLCK, 1)
@@ -83,13 +79,17 @@ class MuseTests(unittest.TestCase):
             write_rows(path, rows)
             with path.open('a', encoding='utf-8') as stream:
                 stream.write('{"incomplete":')
-            _, context, task, state, detail = tracker.MuseTracker(folder).details(path)
+            _, task, state, detail = tracker.MuseTracker(folder).details(path)
             self.assertEqual(task, 'Original objective')
-            self.assertIn('Original objective', context)
-            self.assertIn('Refinement 7', context)
-            self.assertNotIn('Refinement 0', context)
-            self.assertNotIn('xxx', context)
             self.assertEqual((state, detail), ('waiting', ''))
+
+    def test_title_skips_context_and_greeting_prompts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'session.jsonl'
+            write_rows(path, [muse_event('started', prompt='hi'),
+                              muse_event('started', prompt='This repo is a Unity game. Please fix the camera jitter.')])
+            _, task, _, _ = tracker.MuseTracker(folder).details(path)
+            self.assertEqual(task, 'Fix the camera jitter')
 
     def test_xdg_home(self):
         with patch.dict(tracker.os.environ, {'XDG_DATA_HOME': r'C:\AgentData'}):

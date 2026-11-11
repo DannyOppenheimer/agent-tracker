@@ -2,6 +2,7 @@
 from collections import defaultdict
 from datetime import datetime
 import json
+import math
 from pathlib import Path
 import re
 import unicodedata
@@ -22,6 +23,8 @@ def mapping(value):
 
 def stamp(value):
     if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return 0  # inf would never shrink below the epoch-seconds threshold.
         while value > 100_000_000_000:
             value /= 1000
         return value

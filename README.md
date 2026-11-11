@@ -21,10 +21,10 @@ Install and sign in to the agents you want to track using your own accounts. Ope
 
 Active chats are ordered by their latest user prompt, newest first, across all providers and folders. Replies and tool activity do not change that order. Chats without a recorded prompt time appear last, grouped alphabetically by provider and then by folder; new untimed prompts are ordered when the tracker observes them.
 
-- **Claude Code** sessions come from local session registrations and transcripts. Usage comes from Claude's status-line payload.
+- **Claude Code** sessions come from local session registrations and transcripts. Task titles are the ones Claude Code itself saves in each transcript. Usage comes from Claude's status-line payload.
 - **Codex** sessions come from the local state database and held thread-writer locks. Account usage requires the Codex CLI on PATH and a working login. The tracker refreshes account limits every 60 seconds.
 - **Antigravity CLI (`agy`)** sessions come from local presence locks and conversation summaries. Gemini usage comes from Antigravity's status-line payload.
-- **Meta Muse Code (`muse`)** sessions come from held `.session.lock` files and event logs under `%USERPROFILE%\.local\share\muse\sessions` (or `%XDG_DATA_HOME%\muse\sessions`). Task summaries use the same background Codex summarizer as Claude; activity comes from recorded run and tool events.
+- **Meta Muse Code (`muse`)** sessions come from held `.session.lock` files and event logs under `%USERPROFILE%\.local\share\muse\sessions` (or `%XDG_DATA_HOME%\muse\sessions`). Muse saves no chat title, so the tracker extracts one offline from the requests; activity comes from recorded run and tool events.
 - **Grok Build (`grok`, the official xAI CLI)** sessions come from `%USERPROFILE%\.grok\active_sessions.json`, checked against live process IDs. Task titles and activity come from each session's `summary.json` and ACP `updates.jsonl`. Set `GROK_HOME` to select a different Grok directory. Saved sessions without a live registration are excluded.
 
 Muse and Grok also have account usage cards, in pink and light gray respectively. Muse requires Muse Code 1.4.13 or newer and reads subscription allowance through `muse usage --json`. Grok reads account billing through the official CLI's ACP `x.ai/billing` extension, showing the reported weekly/monthly allowance, reset time, and prepaid/on-demand credits when available. Both use the CLI's existing login, refresh every 60 seconds in the background, and retain previous readings after refresh failures. No model prompts are sent to collect usage. Missing allowances are shown as unavailable, including Muse API-key logins without subscription data.
@@ -103,7 +103,7 @@ agent-tracker --usage-json
 agent-tracker --setup-usage
 ```
 
-`--demo` previews sample sessions for all five providers and illustrates percentage, no-subscription, and token-spend tiles using sample billing states. `--json` prints open sessions and waits for pending Claude and Muse task summaries. `--usage-json` refreshes and prints usage for all detected providers without generating summaries.
+`--demo` previews sample sessions for all five providers and illustrates percentage, no-subscription, and token-spend tiles using sample billing states. `--json` prints open sessions once. `--usage-json` refreshes and prints usage for all detected providers.
 
 ## Build the Windows ZIP
 
@@ -136,11 +136,11 @@ Session costs are displayed only when supplied directly by the provider. Provide
 
 Session detection depends on local agent file formats and Windows locking behavior, which may change between agent versions. Activity is approximate. Antigravity currently reports working or waiting based on its conversation summary. Closed historical chats are filtered using held presence locks.
 
-Claude and Muse task titles are generated through background `codex exec` calls using your existing Codex login. These calls send selected user-request text from those sessions to Codex and consume your Codex allowance. Cached titles are reused, and failed calls retry after five minutes. If Codex is unavailable, the tracker displays the original request or a previously cached title. Grok uses its own saved title or summary, falling back to a user prompt from recent updates.
+Task titles never involve a model call or send chat text anywhere. Each provider's own saved title is used where one exists: a Claude `/rename` title, then Claude Code's `ai-title`; Codex, Antigravity, and Grok titles from their local state. Muse sessions, and Claude chats before Claude Code has saved a title, use an offline extract (`titles.py`): the first sentence that makes a request, preferring requests and imperatives over scene-setting, with greetings, politeness wrappers, code, URLs, and long paths removed. Grok falls back to a user prompt from recent updates.
 
 Status-line collectors store selected quota, model, context, plan, and cost display fields in each agent's local `tracker-usage` folder. Usage freshness and reset times are displayed. Missing quota readings are labelled unavailable, and previous readings may remain visible after refresh failures.
 
-Source runs cache task titles and request hashes in `task-summaries.json` beside `tracker.py`. Packaged runs use `%LOCALAPPDATA%\Agent Tracker\task-summaries.json`. These caches and build outputs are excluded from Git.
+The tracker keeps no title cache. Earlier versions wrote `task-summaries.json` beside `tracker.py` or in `%LOCALAPPDATA%\Agent Tracker\`; that file is no longer used and can be deleted. Build outputs are excluded from Git.
 
 ## Source files
 
@@ -152,6 +152,7 @@ Source runs cache task titles and request hashes in `task-summaries.json` beside
 - `session_usage.py` contains per-session context, token counts, and directly reported costs.
 - `quota.py` reads Muse subscription allowance and Grok billing through their CLIs, keeping credentials inside the CLI.
 - `message_groups.py` detects message exchanges, expires group membership, and fits colored text to terminal columns.
+- `titles.py` extracts task titles offline from user requests when an agent saves no title.
 - `agent_tracker_dev.py` and `dev_scenarios.py` provide eight isolated dashboard scenarios; see [TEST-SCENARIOS.md](TEST-SCENARIOS.md).
 - `test_*.py` cover tracking, collectors, session metrics, and the shared tile contract.
 - `build-windows.ps1` creates the portable Windows archive or a separate development executable.
