@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.build/
+.build-deps/
+build/
+dist/
+release/
+*.spec
+task-summaries.json
+task-summaries.tmp
+.venv/
+.env
